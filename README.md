@@ -91,7 +91,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/
 cmake --build build --config Release --target zeroflow-core
 ```
 
-The historical CMake target name is zeroflow-core; its output is ZeroFlow.exe. File clipboard tests are included in `tests/clipboard-files`, separately from the runtime. Configure that directory with the same generator, static vcpkg toolchain and triplets, then build and run `ctest -C Release --output-on-failure` in its build directory.
+The historical CMake target name is zeroflow-core; its output is ZeroFlow.exe. Local validation tests are not distributed in this repository, source archives, or runtime.
 
 Two-machine testing has confirmed repeated keyboard/mouse crossings between a desktop and an MSI Claw, with no unwanted clicks or disconnects in the final test. Secure-desktop behavior and stock Deskflow interoperability require their own validation.
 

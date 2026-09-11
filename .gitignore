@@ -46,6 +46,9 @@ CMakeFiles/*
 # scripts folder
 /scripts
 
+# Local validation only; tests are not distributed with source releases.
+/tests
+
 # Ai helperfilers
 **/[cC]laude.[mM][dD]
 **/CLAUDE.[mM][dD]
