@@ -32,6 +32,10 @@ if(WIN32)
     MSWindowsClipboardBitmapConverter.h
     MSWindowsClipboardFacade.cpp
     MSWindowsClipboardFacade.h
+    MSWindowsClipboardFilesConverter.cpp
+    MSWindowsClipboardFilesConverter.h
+    FileClipboardTransfer.cpp
+    FileClipboardTransfer.h
     MSWindowsClipboardHTMLConverter.cpp
     MSWindowsClipboardHTMLConverter.h
     MSWindowsClipboardUTF16Converter.cpp
@@ -174,6 +178,9 @@ endif()
 add_library(platform STATIC ${PLATFORM_SOURCES})
 
 target_link_libraries(platform PUBLIC client ${libs})
+if(WIN32)
+  target_link_libraries(platform PRIVATE userenv wtsapi32 Qt6::Network OpenSSL::Crypto)
+endif()
 
 if(UNIX)
   target_link_libraries(platform PRIVATE net app)

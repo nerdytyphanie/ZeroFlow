@@ -1,6 +1,6 @@
 # ZeroFlow
 
-ZeroFlow is a **Windows-only, fully headless** fork of [Deskflow](https://github.com/deskflow/deskflow). It shares a computer's keyboard, mouse, and text/image clipboard with another computer on a trusted local network.
+ZeroFlow is a **Windows-only, fully headless** fork of [Deskflow](https://github.com/deskflow/deskflow). It shares a computer's keyboard, mouse, and clipboard with another computer on a trusted local network.
 
 It is intended for command-line use and integration into applications that manage its settings and lifetime. **There is no graphical interface, tray icon, setup wizard, or standalone desktop application.** Running the executable without the required arguments does not open a window.
 
@@ -15,11 +15,20 @@ The portable Windows x64 runtime is one executable, approximately 15 MB. It does
 - Headless server and client modes in the same executable.
 - Keyboard and mouse sharing between screens.
 - Text and image clipboard sharing over the main connection, limited to 3 MiB by default. Oversized clipboard transfers are discarded without disconnecting input.
+- File and folder clipboard sharing, limited to **384 MiB total per selection and 128 regular files**, including nested folders and empty folders. Any combination within those limits is supported.
 - TLS connections, with automatic acceptance and storage of peer fingerprints.
 - Local-network ZeroFlow discovery and automatic placement of newly connected screens in the server layout.
 - Optional JSON status/heartbeat output and a stdin command for graceful shutdown.
 
-This fork does **not** provide a GUI, tray controls, graphical screen-layout editor, file/folder transfer, or macOS/Linux binaries. The original standalone ZeroFlow work is a separate project and is not distributed here.
+This fork does **not** provide a GUI, tray controls, graphical screen-layout editor, or macOS/Linux binaries. The original standalone ZeroFlow work is a separate project and is not distributed here.
+
+## File clipboard
+
+Version 1.2 adds file and folder sharing. Update both computers to use it. Copy a selection, then move the shared pointer to the receiving computer. Files transfer in the background over a separate TLS connection using 1 MiB buffers, with a 16 ms pause after every 64 MiB sent. File contents are streamed directly to disk rather than loaded as a whole selection into memory. Input and text/image clipboard traffic retain their existing connection and limits.
+
+The receiver stages the complete selection under a fresh `ZeroFlow-Clipboard-<id>` directory in the interactive user's ordinary Windows temp folder. Paste becomes available only after the entire selection arrives. Windows Explorer is asked to **move** the staged files to the paste destination; sender originals remain untouched. After all staged roots have been moved away, ZeroFlow clears that received file clipboard without clearing a newer copy. Applications that ignore Windows' preferred move action may copy instead, leaving the staged files and clipboard available.
+
+Unpasted successful transfers are left for normal temp cleanup; Windows does not guarantee a particular cleanup time. Failed or cancelled transfers remove their incomplete staging. Invalid paths, linked/reparse-point files, offline files, oversized selections, and selections exceeding 128 regular files are rejected. A file-transfer failure does not close the keyboard/mouse connection.
 
 Automatic trust is intended for a trusted local network. It is not an authenticated public-internet pairing workflow. An upstream Deskflow peer still uses its own certificate approval and screen-layout configuration. The connection protocol is based on Deskflow; interoperability with a current stock Deskflow build still needs a dedicated test.
 
@@ -40,6 +49,7 @@ Default network ports:
 | --- | --- |
 | TCP 24800 | Keyboard, mouse, and clipboard connection |
 | UDP 24801 | ZeroFlow local discovery |
+| TCP 24802 | Background file/folder clipboard transfer |
 
 Allow these only on the local network. Only one sharing core can own an interactive Windows session at a time.
 
@@ -81,9 +91,11 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/
 cmake --build build --config Release --target zeroflow-core
 ```
 
-The historical CMake target name is zeroflow-core; its output is ZeroFlow.exe. Tests are not included in this source tree or in the runtime.
+The historical CMake target name is zeroflow-core; its output is ZeroFlow.exe. File clipboard tests are included in `tests/clipboard-files`, separately from the runtime. Configure that directory with the same generator, static vcpkg toolchain and triplets, then build and run `ctest -C Release --output-on-failure` in its build directory.
 
 Two-machine testing has confirmed repeated keyboard/mouse crossings between a desktop and an MSI Claw, with no unwanted clicks or disconnects in the final test. Secure-desktop behavior and stock Deskflow interoperability require their own validation.
+
+Version 1.2 was also tested with clipboard transfers from an MSI Claw to a desktop: 128 files totaling 371.2 MiB staged in approximately 7 seconds, and one 383 MiB file in approximately 4.1 seconds. SHA-256 hashes matched before and after paste, staged files moved out of temp, and clipboard clearing was observed. Input heartbeats continued and the user reported no loss of control while crossing screens during the folder transfer. These timings describe that network, not a guaranteed transfer rate.
 
 ## Attribution and license
 

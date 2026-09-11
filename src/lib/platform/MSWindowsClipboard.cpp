@@ -11,8 +11,11 @@
 #include "base/Log.h"
 #include "platform/MSWindowsClipboardBitmapConverter.h"
 #include "platform/MSWindowsClipboardFacade.h"
+#include "platform/MSWindowsClipboardFilesConverter.h"
+#include "platform/FileClipboardTransfer.h"
 #include "platform/MSWindowsClipboardHTMLConverter.h"
 #include "platform/MSWindowsClipboardUTF16Converter.h"
+#include <oleidl.h>
 
 //
 // MSWindowsClipboard
@@ -30,6 +33,7 @@ MSWindowsClipboard::MSWindowsClipboard(HWND window)
   m_converters.push_back(new MSWindowsClipboardUTF16Converter);
   m_converters.push_back(new MSWindowsClipboardBitmapConverter);
   m_converters.push_back(new MSWindowsClipboardHTMLConverter);
+  m_converters.push_back(new MSWindowsClipboardFilesConverter);
 }
 
 MSWindowsClipboard::~MSWindowsClipboard()
@@ -67,6 +71,7 @@ bool MSWindowsClipboard::emptyUnowned()
 
 bool MSWindowsClipboard::empty()
 {
+  FileClipboardTransfer::cancelReceive();
   if (!emptyUnowned()) {
     return false;
   }
@@ -87,6 +92,10 @@ void MSWindowsClipboard::add(Format format, const std::string &data)
   // exit early if there is no data to prevent spurious "failed to convert clipboard data" errors
   if (data.empty()) {
     LOG_DEBUG("not adding 0 bytes to clipboard format: %d", format);
+    return;
+  }
+  if (format == Format::Files) {
+    FileClipboardTransfer::receiveAsync(m_window, data);
     return;
   }
   bool isSucceeded = false;
@@ -154,6 +163,9 @@ IClipboard::Time MSWindowsClipboard::getTime() const
 
 bool MSWindowsClipboard::has(Format format) const
 {
+  // File selections have one bounded payload, not additional shell text/image formats.
+  if (IsClipboardFormatAvailable(CF_HDROP) && format != Format::Files)
+    return false;
   for (ConverterList::const_iterator index = m_converters.begin(); index != m_converters.end(); ++index) {
     IMSWindowsClipboardConverter *converter = *index;
     if (converter->getFormat() == format) {
@@ -194,6 +206,7 @@ std::string MSWindowsClipboard::get(Format format) const
   }
 
   // convert
+  if (format == Format::Files) return FileClipboardTransfer::offer(win32Data);
   return converter->toIClipboard(win32Data);
 }
 

@@ -51,6 +51,7 @@ public:
     Text,        //!< Text format, UTF-8, newline is LF
     HTML,        //!< HTML format, HTML fragment, UTF-8, newline is LF
     Bitmap,      //!< Bitmap format, BMP 24/32bpp, BI_RGB
+    Files,       //!< ZeroFlow file contents; received temporary files request move-on-paste
     TotalFormats //!< The number of clipboard formats supported
   };
 

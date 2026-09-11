@@ -15,6 +15,7 @@
 #include "deskflow/ServerApp.h"
 #include "deskflow/ipc/CoreIpcServer.h"
 #include "net/SecureUtils.h"
+#include "platform/FileClipboardTransfer.h"
 #include <QCoreApplication>
 #include <QCommandLineParser>
 #include <QFileInfo>
@@ -38,6 +39,8 @@ int main(int argc, char **argv)
   ArchMiscWindows::setInstanceWin32(GetModuleHandle(nullptr));
   QCoreApplication app(argc, argv);
   QCoreApplication::setApplicationName("ZeroFlow");
+  FileClipboardTransfer::start();
+  QObject::connect(&app, &QCoreApplication::aboutToQuit, [] { FileClipboardTransfer::stop(); });
   Arch arch;
   arch.init();
   Log log;
