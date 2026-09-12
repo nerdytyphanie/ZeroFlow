@@ -1284,6 +1284,10 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
         -y + bogusZoneSize > m_yCenter - m_y || y + bogusZoneSize > m_y + m_h - m_yCenter) {
 
       LOG_DEBUG("dropped bogus delta motion: %+d,%+d", x, y);
+      // The warp marker may still be queued behind more pre-warp motion.
+      // Do not let this rejected position become their delta baseline: a
+      // second stale event could otherwise look like a small valid reversal.
+      saveMousePosition(m_xCenter, m_yCenter);
     } else {
       // send motion
       sendEvent(EventTypes::PrimaryScreenMotionOnSecondary, MotionInfo::alloc(x, y));
