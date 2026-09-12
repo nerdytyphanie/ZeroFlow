@@ -163,6 +163,8 @@ struct Staging {
 };
 struct Snapshot {
   DWORD sequence = 0;
+  HWND window = nullptr;
+  bool pasted = false;
   QByteArray token;
   std::vector<fs::path> roots;
   std::vector<fs::path> files;
@@ -171,6 +173,29 @@ struct Snapshot {
   std::vector<BY_HANDLE_FILE_INFORMATION> identities;
   Progress progress;
 };
+void clearSourceClipboard(const Snapshot &snapshot, const std::function<bool()> &cancelled)
+{
+  // A newer copy, even of the same paths, belongs to the user and must survive.
+  if (GetClipboardSequenceNumber() != snapshot.sequence) return;
+  bool opened = false;
+  for (int attempt = 0; attempt < 50 && !cancelled(); ++attempt) {
+    if (OpenClipboard(snapshot.window)) { opened = true; break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  networkCheck(opened, "source clipboard is busy");
+  struct Close { ~Close() { CloseClipboard(); } } close;
+  if (GetClipboardSequenceNumber() != snapshot.sequence) return;
+  auto drop = GetClipboardData(CF_HDROP);
+  if (!drop || DragQueryFileW(static_cast<HDROP>(drop), 0xffffffff, nullptr, 0) != snapshot.roots.size()) return;
+  for (UINT i = 0; i < snapshot.roots.size(); ++i) if (dropPath(drop, i) != snapshot.roots[i]) return;
+  // Keep the empty clipboard local; broadcasting it could erase a newer remote copy.
+  Drop marker{GlobalAlloc(GMEM_MOVEABLE, 1)};
+  auto format = RegisterClipboardFormatW(L"Deskflow Ownership");
+  check(snapshot.window && marker.value && format, "source clipboard owner unavailable");
+  networkCheck(EmptyClipboard() != 0, "source clipboard could not be cleared");
+  check(SetClipboardData(format, marker.value) != nullptr, "source clipboard ownership failed");
+  marker.value = nullptr;
+}
 void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled, Limits limits)
 {
   if (!snapshot.manifest.isEmpty()) return;
@@ -290,15 +315,27 @@ void Service::serve(std::stop_token stop)
           offset = get32(options.first(4)); peerSpeed = get32(options.mid(4, 4)); peerMaximum = get32(options.last(4));
           check(peerMaximum <= Converter::MaxSelectionBytes && peerSpeed <= 1024, "invalid transfer limits");
         }
-        { std::lock_guard lock(mutex); snapshot = current; }
-        check(snapshot && request.mid(4, 32) == snapshot->token, "expired file clipboard offer");
+        { std::lock_guard lock(mutex); if (current && request.mid(4, 32) == current->token) snapshot = current; }
+        check(snapshot != nullptr, "expired file clipboard offer");
+        auto index = get32(request.last(4));
+        if (resume && index == PastedIndex) {
+          if (!snapshot->pasted) {
+            clearSourceClipboard(*snapshot, cancelled);
+            snapshot->pasted = true;
+            snapshot->progress.done = snapshot->progress.total;
+            snapshot->progress.report("pasted");
+          }
+          // Keep the completed token for idempotent retries if this reply is lost.
+          sendBytes(socket, QByteArray(wide ? 8 : 4, '\0'), cancelled, bytesSincePause);
+          continue;
+        }
+        check(!snapshot->pasted, "completed file clipboard offer");
         Limits limits{configured ? std::min(selectionLimit.load(), peerMaximum) : peerMaximum,
                       configured ? std::min(fileLimit.load(), peerFiles) : peerFiles};
         prepare(*snapshot, cancelled, limits);
-        auto index = get32(request.last(4));
-        if (resume && (index == ReadyIndex || index == PastedIndex)) {
+        if (resume && index == ReadyIndex) {
           snapshot->progress.done = snapshot->progress.total;
-          snapshot->progress.report(index == ReadyIndex ? "ready" : "pasted");
+          snapshot->progress.report("ready");
           sendBytes(socket, QByteArray(wide ? 8 : 4, '\0'), cancelled, bytesSincePause);
           continue;
         }
@@ -353,10 +390,10 @@ void Service::serve(std::stop_token stop)
           if (index + 1 == snapshot->files.size()) progress.report("sent");
         }
       } catch (const NetworkError &) {
-        if (snapshot) snapshot->progress.report("retrying");
+        if (snapshot && !snapshot->pasted) snapshot->progress.report("retrying");
         socket.abort();
       } catch (const std::exception &) {
-        if (snapshot) snapshot->progress.report("failed");
+        if (snapshot && !snapshot->pasted) snapshot->progress.report("failed");
         socket.abort();
       }
     }
@@ -450,7 +487,6 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
     if (!next) {
       if (publishedPaths.empty() || Clock::now() < nextPasteCheck) continue;
       nextPasteCheck = Clock::now() + std::chrono::milliseconds(500);
-      if (GetClipboardOwner() != publishedWindow) { publishedPaths.clear(); continue; }
       ClipboardDesktopUser user;
       if (!user.valid) continue;
       bool moved = true;
@@ -458,7 +494,11 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
         std::error_code error;
         if (fs::exists(path, error) || error) { moved = false; break; }
       }
-      if (!moved || !OpenClipboard(publishedWindow)) continue;
+      if (!moved) {
+        if (GetClipboardOwner() != publishedWindow) publishedPaths.clear();
+        continue;
+      }
+      if (!OpenClipboard(publishedWindow)) continue;
       bool pasted = false;
       // Recheck under the clipboard lock: a newer copy must never be cleared.
       try {
@@ -466,7 +506,8 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
         bool same = GetClipboardOwner() == publishedWindow && drop &&
             DragQueryFileW(static_cast<HDROP>(drop), 0xffffffff, nullptr, 0) == publishedPaths.size();
         for (UINT i = 0; same && i < publishedPaths.size(); ++i) same = dropPath(drop, i) == publishedPaths[i];
-        if (same && EmptyClipboard()) {
+        if (!same) pasted = true; // Paste completed, but preserve the receiver's newer clipboard.
+        else if (EmptyClipboard()) {
           pasted = true;
           auto marker = GlobalAlloc(GMEM_MOVEABLE, 1);
           if (marker && !SetClipboardData(RegisterClipboardFormatW(L"Deskflow Ownership"), marker)) GlobalFree(marker);
@@ -480,7 +521,7 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
           catch (const std::exception &) { }
         }
       }
-      publishedPaths.clear();
+      if (pasted) publishedPaths.clear();
       continue;
     }
     publishedPaths.clear();
@@ -548,7 +589,7 @@ void FileClipboardTransfer::stop()
   if (s.receiver.joinable()) s.receiver.join(); if (s.server.joinable()) s.server.join();
 }
 void FileClipboardTransfer::cancelReceive() { service().generation++; }
-std::string FileClipboardTransfer::offer(HANDLE drop)
+std::string FileClipboardTransfer::offer(HANDLE drop, HWND window)
 {
   auto &s = service(); if (!s.listening) return {};
   auto snapshot = std::make_shared<Snapshot>(); snapshot->token.resize(32);
@@ -557,6 +598,7 @@ std::string FileClipboardTransfer::offer(HANDLE drop)
   if (!count || count > Converter::MaxMetadataBytes / 9) return {};
   for (UINT i = 0; i < count; ++i) snapshot->roots.push_back(dropPath(drop, i));
   snapshot->sequence = GetClipboardSequenceNumber();
+  snapshot->window = window;
   QJsonArray hosts;
   for (const auto &address : QNetworkInterface::allAddresses())
     if (local(address) && !address.isLoopback() && hosts.size() < 16) hosts.append(address.toString());

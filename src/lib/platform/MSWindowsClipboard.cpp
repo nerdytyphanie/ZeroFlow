@@ -206,7 +206,7 @@ std::string MSWindowsClipboard::get(Format format) const
   }
 
   // convert
-  if (format == Format::Files) return FileClipboardTransfer::offer(win32Data);
+  if (format == Format::Files) return FileClipboardTransfer::offer(win32Data, m_window);
   return converter->toIClipboard(win32Data);
 }
 
