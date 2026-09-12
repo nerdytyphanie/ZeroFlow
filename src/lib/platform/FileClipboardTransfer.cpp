@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 #include "platform/FileClipboardTransfer.h"
+#include "base/HeadlessStatus.h"
 #include "platform/MSWindowsClipboardFilesConverter.h"
 #include <shellapi.h>
 #include <shlobj.h>
@@ -33,6 +34,52 @@ using Converter = MSWindowsClipboardFilesConverter;
 using Clock = std::chrono::steady_clock;
 constexpr qsizetype ChunkBytes = 1024 * 1024;
 constexpr qsizetype PauseBytes = 64 * ChunkBytes;
+constexpr quint32 ReadyIndex = UINT32_MAX - 1;
+constexpr quint32 PastedIndex = UINT32_MAX - 2;
+constexpr quint64 UnlimitedBytes = INT64_MAX;
+std::atomic<quint64> speedLimit = 0;
+std::atomic<quint64> selectionLimit = Converter::MaxSelectionBytes;
+std::atomic<quint32> fileLimit = Converter::MaxFiles;
+std::atomic<bool> configured = false;
+struct Limits { quint64 bytes; quint32 files; };
+Limits receiveLimits(const QJsonObject &offer) {
+  if (!configured && offer["policy"].toBool()) {
+    auto bytes = offer["maximum"].toInteger(-1), files = offer["files"].toInteger(-1);
+    if (bytes >= 0 && files > 0 && files < PastedIndex) return {quint64(bytes), quint32(files)};
+  }
+  return {selectionLimit.load(), fileLimit.load()};
+}
+struct NetworkError : std::runtime_error { using std::runtime_error::runtime_error; };
+void networkCheck(bool ok, const char *reason) { if (!ok) throw NetworkError(reason); }
+struct Progress {
+  QString id, direction;
+  quint64 total = 0, done = 0;
+  int retries = 0;
+  Clock::time_point started = Clock::now(), last = {};
+  void report(const char *state, const QString &file = {}) {
+    auto now = Clock::now();
+    if (QStringView(u"transferring") == QLatin1StringView(state) && now - last < std::chrono::milliseconds(250)) return;
+    last = now;
+    double seconds = std::chrono::duration<double>(now - started).count();
+    HeadlessStatus::transfer({{"id", id}, {"direction", direction}, {"state", state},
+      {"bytes", qint64(done)}, {"total", qint64(total)}, {"bytesPerSecond", seconds > 0 ? done / seconds : 0},
+      {"retries", retries}, {"file", file.left(160)}});
+  }
+};
+struct RateLimit {
+  quint64 peerMiB = 0;
+  Clock::time_point next = Clock::now();
+  void wait(qsizetype bytes, const std::function<bool()> &cancelled) {
+    auto cap = speedLimit.load();
+    if (peerMiB && (!cap || peerMiB < cap)) cap = peerMiB;
+    if (!cap) return;
+    next = std::max(next, Clock::now()) + std::chrono::nanoseconds(qint64(1e9 * bytes / (double(cap) * ChunkBytes)));
+    while (Clock::now() < next) {
+      if (cancelled()) throw std::runtime_error("file transfer cancelled");
+      std::this_thread::sleep_for(std::min(next - Clock::now(), Clock::duration(std::chrono::milliseconds(10))));
+    }
+  }
+};
 void check(bool ok, const char *reason) { if (!ok) throw std::runtime_error(reason); }
 struct DiskFile {
   HANDLE value = INVALID_HANDLE_VALUE;
@@ -42,6 +89,10 @@ void put32(QByteArray &data, quint32 n)
 { for (int shift = 24; shift >= 0; shift -= 8) data.append(char(n >> shift)); }
 quint32 get32(const QByteArray &data)
 { quint32 n = 0; for (int i = 0; i < 4; ++i) n = (n << 8) | static_cast<unsigned char>(data[i]); return n; }
+void put64(QByteArray &data, quint64 n)
+{ for (int shift = 56; shift >= 0; shift -= 8) data.append(char(n >> shift)); }
+quint64 get64(const QByteArray &data)
+{ quint64 n = 0; for (int i = 0; i < 8; ++i) n = (n << 8) | static_cast<unsigned char>(data[i]); return n; }
 bool local(const QHostAddress &address)
 {
   bool ok = false; auto ip = address.toIPv4Address(&ok);
@@ -55,7 +106,7 @@ QByteArray readBytes(QSslSocket &socket, qsizetype length, const std::function<b
     check(!cancelled(), "file transfer cancelled");
     if (!socket.bytesAvailable()) {
       socket.waitForReadyRead(100);
-      check(socket.bytesAvailable() || (socket.state() != QAbstractSocket::UnconnectedState && Clock::now() < deadline), "file transfer timed out");
+      networkCheck(socket.bytesAvailable() || (socket.state() != QAbstractSocket::UnconnectedState && Clock::now() < deadline), "file transfer timed out");
       continue;
     }
     result += socket.read(std::min<qsizetype>(ChunkBytes, length - result.size()));
@@ -68,9 +119,10 @@ void sendBytes(QSslSocket &socket, const QByteArray &data, const std::function<b
   for (qsizetype offset = 0; offset < data.size();) {
     check(!cancelled(), "file transfer cancelled");
     auto count = std::min<qsizetype>(ChunkBytes, data.size() - offset);
-    check(socket.write(data.constData() + offset, count) == count, "file socket write failed");
+    networkCheck(socket.write(data.constData() + offset, count) == count, "file socket write failed");
     while (socket.bytesToWrite()) {
-      check(!cancelled() && socket.waitForBytesWritten(1000), "file socket stopped accepting data");
+      check(!cancelled(), "file transfer cancelled");
+      networkCheck(socket.waitForBytesWritten(1000), "file socket stopped accepting data");
     }
     offset += count;
     bytesSincePause += count;
@@ -114,10 +166,12 @@ struct Snapshot {
   QByteArray token;
   std::vector<fs::path> roots;
   std::vector<fs::path> files;
-  std::vector<quint32> sizes;
+  std::vector<quint64> sizes;
   QByteArray manifest;
+  std::vector<BY_HANDLE_FILE_INFORMATION> identities;
+  Progress progress;
 };
-void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled)
+void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled, Limits limits)
 {
   if (!snapshot.manifest.isEmpty()) return;
   snapshot.files.clear(); snapshot.sizes.clear();
@@ -134,7 +188,7 @@ void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled)
           "linked, offline or unavailable files cannot be transferred");
     bool directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     auto size = directory ? 0 : fs::file_size(path);
-    check(size <= Converter::MaxFileBytes, "a selected file exceeds 384 MiB");
+    check(size <= limits.bytes, "a selected file exceeds the configured size limit");
     QJsonObject entry{{"path", QString::fromStdWString(relative)}, {"directory", directory}, {"size", qint64(size)}};
     metadata += QJsonDocument(entry).toJson(QJsonDocument::Compact).size() + 1;
     check(metadata < Converter::MaxMetadataBytes && relative.size() <= 30000, "file selection metadata is too large");
@@ -143,12 +197,14 @@ void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled)
       for (const auto &child : fs::directory_iterator(path))
         pending.push_back({child.path(), relative + L'/' + child.path().filename().wstring()});
     } else {
-      check(snapshot.files.size() < Converter::MaxFiles, "a selection exceeds 128 files");
+      check(snapshot.files.size() < limits.files, "selection exceeds the configured file count");
+      check(total <= limits.bytes && size <= limits.bytes - total, "selection exceeds the configured size limit");
       total += size;
-      check(total <= Converter::MaxSelectionBytes, "selection exceeds 384 MiB");
-      snapshot.files.push_back(path); snapshot.sizes.push_back(static_cast<quint32>(size));
+      snapshot.files.push_back(path); snapshot.sizes.push_back(size);
     }
   }
+  snapshot.identities.resize(snapshot.files.size());
+  snapshot.progress = Progress{QString::fromLatin1(snapshot.token.toHex()), "send", total};
   snapshot.manifest = QJsonDocument(entries).toJson(QJsonDocument::Compact);
   check(!entries.empty() && snapshot.manifest.size() <= Converter::MaxMetadataBytes, "empty or oversized manifest");
 }
@@ -215,17 +271,40 @@ void Service::serve(std::stop_token stop)
       socket.setPeerVerifyMode(QSslSocket::VerifyNone); socket.startServerEncryption();
       if (!socket.waitForEncrypted(5000)) continue;
       auto cancelled = [&] { return stop.stop_requested(); };
+      std::shared_ptr<Snapshot> snapshot;
       try {
         ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
         auto request = readBytes(socket, 40, cancelled);
-        check(request.first(4) == "ZFR1", "unknown file clipboard request");
-        std::shared_ptr<Snapshot> snapshot;
+        bool wide = request.first(4) == "ZFR3";
+        bool resume = wide || request.first(4) == "ZFR2";
+        check(resume || request.first(4) == "ZFR1", "unknown file clipboard request");
+        quint64 offset = 0, peerSpeed = 0, peerMaximum = Converter::MaxSelectionBytes;
+        quint32 peerFiles = Converter::MaxFiles;
+        if (wide) {
+          auto options = readBytes(socket, 28, cancelled);
+          offset = get64(options.first(8)); peerSpeed = get64(options.mid(8, 8)); peerMaximum = get64(options.mid(16, 8));
+          peerFiles = get32(options.last(4));
+          check(peerMaximum <= UnlimitedBytes && peerFiles > 0, "invalid transfer limits");
+        } else if (resume) {
+          auto options = readBytes(socket, 12, cancelled);
+          offset = get32(options.first(4)); peerSpeed = get32(options.mid(4, 4)); peerMaximum = get32(options.last(4));
+          check(peerMaximum <= Converter::MaxSelectionBytes && peerSpeed <= 1024, "invalid transfer limits");
+        }
         { std::lock_guard lock(mutex); snapshot = current; }
         check(snapshot && request.mid(4, 32) == snapshot->token, "expired file clipboard offer");
-        prepare(*snapshot, cancelled);
+        Limits limits{configured ? std::min(selectionLimit.load(), peerMaximum) : peerMaximum,
+                      configured ? std::min(fileLimit.load(), peerFiles) : peerFiles};
+        prepare(*snapshot, cancelled, limits);
         auto index = get32(request.last(4));
+        if (resume && (index == ReadyIndex || index == PastedIndex)) {
+          snapshot->progress.done = snapshot->progress.total;
+          snapshot->progress.report(index == ReadyIndex ? "ready" : "pasted");
+          sendBytes(socket, QByteArray(wide ? 8 : 4, '\0'), cancelled, bytesSincePause);
+          continue;
+        }
+        check(snapshot->progress.total <= limits.bytes && snapshot->files.size() <= limits.files, "selection exceeds configured limit");
         if (index == UINT32_MAX) {
-          QByteArray length; put32(length, static_cast<quint32>(snapshot->manifest.size()));
+          QByteArray length; if (wide) put64(length, snapshot->manifest.size()); else put32(length, static_cast<quint32>(snapshot->manifest.size()));
           sendBytes(socket, length, cancelled, bytesSincePause);
           sendBytes(socket, snapshot->manifest, cancelled, bytesSincePause);
         }
@@ -236,64 +315,134 @@ void Service::serve(std::stop_token stop)
                                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
           check(file.value != INVALID_HANDLE_VALUE && GetFileType(file.value) == FILE_TYPE_DISK, "source file could not be opened");
           BY_HANDLE_FILE_INFORMATION info{};
-          check(GetFileInformationByHandle(file.value, &info) && !info.nFileSizeHigh &&
-                info.nFileSizeLow == snapshot->sizes[index] &&
+          check(GetFileInformationByHandle(file.value, &info) &&
+                ((quint64(info.nFileSizeHigh) << 32) | info.nFileSizeLow) == snapshot->sizes[index] &&
                 !(info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_DIRECTORY)),
                 "source file changed or is unavailable");
-          QByteArray length; put32(length, info.nFileSizeLow);
+          auto &identity = snapshot->identities[index];
+          if (identity.dwVolumeSerialNumber || identity.nFileIndexLow || identity.nFileIndexHigh) {
+            check(identity.dwVolumeSerialNumber == info.dwVolumeSerialNumber && identity.nFileIndexHigh == info.nFileIndexHigh &&
+                  identity.nFileIndexLow == info.nFileIndexLow &&
+                  CompareFileTime(&identity.ftLastWriteTime, &info.ftLastWriteTime) == 0, "source changed during retry");
+          } else identity = info;
+          const auto fileSize = snapshot->sizes[index];
+          check(offset <= fileSize && offset % ChunkBytes == 0, "invalid resume offset");
+          LARGE_INTEGER position{}; position.QuadPart = offset;
+          check(SetFilePointerEx(file.value, position, nullptr, FILE_BEGIN), "source seek failed");
+          auto &progress = snapshot->progress;
+          progress.done = offset;
+          for (quint32 i = 0; i < index; ++i) progress.done += snapshot->sizes[i];
+          if (index == 0 && offset == 0) { progress.started = Clock::now(); progress.retries = 0; }
+          if (offset) ++progress.retries;
+          auto filename = QString::fromStdWString(snapshot->files[index].filename().wstring());
+          progress.report("transferring", filename);
+          RateLimit rate{peerSpeed};
+          QByteArray length; if (wide) put64(length, fileSize - offset); else put32(length, static_cast<quint32>(fileSize - offset));
           sendBytes(socket, length, cancelled, bytesSincePause);
           QByteArray buffer(ChunkBytes, Qt::Uninitialized);
-          for (quint32 remaining = info.nFileSizeLow; remaining;) {
+          for (quint64 remaining = fileSize - offset; remaining;) {
             check(!cancelled(), "file transfer cancelled");
-            auto count = std::min<quint32>(remaining, static_cast<quint32>(ChunkBytes)); DWORD bytes = 0;
+            auto count = static_cast<DWORD>(std::min<quint64>(remaining, ChunkBytes)); DWORD bytes = 0;
             check(ReadFile(file.value, buffer.data(), count, &bytes, nullptr) && bytes == count, "source file read failed");
+            rate.wait(count, cancelled);
             sendBytes(socket, QByteArray::fromRawData(buffer.constData(), count), cancelled, bytesSincePause);
             remaining -= count;
+            progress.done += count;
+            progress.report("transferring", filename);
           }
+          if (index + 1 == snapshot->files.size()) progress.report("sent");
         }
-      } catch (const std::exception &) { socket.abort(); }
+      } catch (const NetworkError &) {
+        if (snapshot) snapshot->progress.report("retrying");
+        socket.abort();
+      } catch (const std::exception &) {
+        if (snapshot) snapshot->progress.report("failed");
+        socket.abort();
+      }
     }
   } catch (const std::exception &) { listening = false; ready.notify_all(); }
 }
 
-QByteArray fetch(const QJsonObject &offer, quint32 index, qsizetype maximum, const std::function<bool()> &cancelled,
-                const std::function<void(const QByteArray &)> &consume = {}, quint32 expected = UINT32_MAX)
+QByteArray fetch(const QJsonObject &offer, quint32 index, quint64 maximum, const std::function<bool()> &cancelled,
+                const std::function<void(const QByteArray &)> &consume = {}, quint64 expected = UINT64_MAX,
+                Progress *progress = nullptr)
 {
   auto token = QByteArray::fromHex(offer["token"].toString().toLatin1());
   auto fingerprint = offer["sha256"].toString().toLatin1();
   check(token.size() == 32 && fingerprint.size() == 64, "invalid file offer identity");
   auto hosts = offer["hosts"].toArray(); check(!hosts.empty() && hosts.size() <= 16, "invalid file offer addresses");
-  for (const auto &host : hosts) {
+  const bool wide = offer["version"].toInt() >= 3;
+  const bool resume = wide || offer["resume"].toBool();
+  const auto limits = receiveLimits(offer);
+  quint64 committed = 0;
+  std::string failure = "file clipboard endpoint is unavailable";
+  int preferred = -1;
+  // Three reconnect attempts after the initial attempt. Only complete chunks
+  // committed to disk advance the resume offset; a partial read is discarded.
+  for (int attempt = 0; attempt < 4; ++attempt) {
     check(!cancelled(), "file transfer cancelled");
-    QHostAddress address(host.toString()); if (!local(address)) continue;
-    QSslSocket socket; socket.setReadBufferSize(ChunkBytes);
-    socket.setPeerVerifyMode(QSslSocket::VerifyNone);
-    socket.connectToHostEncrypted(address.toString(), 24802);
-    if (!socket.waitForEncrypted(1500)) continue;
-    // The random token is disclosed only after checking the certificate delivered
-    // over the existing TLS clipboard connection. No public CA or automatic trust.
-    if (socket.peerCertificate().digest(QCryptographicHash::Sha256).toHex() != fingerprint) continue;
-    QByteArray request("ZFR1"); request += token; put32(request, index);
-    qsizetype bytesSincePause = 0;
-    sendBytes(socket, request, cancelled, bytesSincePause);
-    auto size = get32(readBytes(socket, 4, cancelled));
-    check(size <= maximum, "oversized file response");
-    if (consume) {
-      check(size == expected, "file response does not match manifest");
+    if (attempt) {
+      if (progress) { ++progress->retries; progress->report("retrying"); }
+      for (int i = 0; i < attempt * 10; ++i) {
+        check(!cancelled(), "file transfer cancelled");
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      }
+    }
+    try {
+      std::unique_ptr<QSslSocket> connection;
+      for (int i = 0; i < hosts.size(); ++i) {
+        int hostIndex = preferred >= 0 ? (preferred + i) % hosts.size() : i;
+        check(!cancelled(), "file transfer cancelled");
+        QHostAddress address(hosts[hostIndex].toString()); if (!local(address)) continue;
+        auto candidate = std::make_unique<QSslSocket>(); candidate->setReadBufferSize(ChunkBytes);
+        candidate->setPeerVerifyMode(QSslSocket::VerifyNone);
+        candidate->connectToHostEncrypted(address.toString(), 24802);
+        if (!candidate->waitForEncrypted(1500)) continue;
+        // Never disclose the offer token before verifying its pinned certificate.
+        if (candidate->peerCertificate().digest(QCryptographicHash::Sha256).toHex() != fingerprint) continue;
+        connection = std::move(candidate); preferred = hostIndex; break;
+      }
+      networkCheck(connection != nullptr, "file clipboard endpoint is unavailable");
+      auto &socket = *connection;
+      QByteArray request(wide ? "ZFR3" : resume ? "ZFR2" : "ZFR1"); request += token; put32(request, index);
+      if (wide) { put64(request, committed); put64(request, speedLimit.load()); put64(request, limits.bytes); put32(request, limits.files); }
+      else if (resume) {
+        put32(request, static_cast<quint32>(committed)); put32(request, static_cast<quint32>(std::min<quint64>(speedLimit.load(), 1024)));
+        put32(request, static_cast<quint32>(std::min<quint64>(selectionLimit.load(), Converter::MaxSelectionBytes)));
+      }
+      qsizetype bytesSincePause = 0;
+      sendBytes(socket, request, cancelled, bytesSincePause);
+      auto size = wide ? get64(readBytes(socket, 8, cancelled)) : quint64(get32(readBytes(socket, 4, cancelled)));
+      check(size <= maximum, "oversized file response");
+      if (!consume) return readBytes(socket, size, cancelled);
+      check(size == expected - (resume ? committed : 0), "file response does not match manifest");
+      // Older senders can be retried safely by skipping the already staged prefix.
+      if (!resume) {
+        for (quint64 skip = committed; skip;) {
+          auto count = std::min<quint64>(skip, ChunkBytes);
+          readBytes(socket, count, cancelled); skip -= count; size -= count;
+        }
+      }
+      RateLimit rate;
       while (size) {
-        auto count = std::min<quint32>(size, static_cast<quint32>(ChunkBytes));
-        consume(readBytes(socket, count, cancelled)); size -= count;
+        auto count = std::min<quint64>(size, ChunkBytes);
+        auto chunk = readBytes(socket, count, cancelled);
+        if (!resume) rate.wait(count, cancelled);
+        check(!cancelled(), "file transfer cancelled");
+        consume(chunk); // Disk errors are permanent and must not be retried.
+        committed += count; size -= count;
+        if (progress) { progress->done += count; progress->report("transferring"); }
       }
       return {};
-    }
-    return readBytes(socket, size, cancelled);
+    } catch (const NetworkError &error) { failure = error.what(); }
   }
-  throw std::runtime_error("file clipboard endpoint is unavailable");
+  throw NetworkError(failure);
 }
 
 Service::Service() : server([this](std::stop_token stop) { serve(stop); }), receiver([this](std::stop_token stop) {
   HWND publishedWindow = nullptr;
   std::vector<fs::path> publishedPaths;
+  QJsonObject publishedOffer;
   auto nextPasteCheck = Clock::now();
   while (!stop.stop_requested()) {
     std::unique_ptr<Job> next;
@@ -310,6 +459,7 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
         if (fs::exists(path, error) || error) { moved = false; break; }
       }
       if (!moved || !OpenClipboard(publishedWindow)) continue;
+      bool pasted = false;
       // Recheck under the clipboard lock: a newer copy must never be cleared.
       try {
         auto drop = GetClipboardData(CF_HDROP);
@@ -317,11 +467,19 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
             DragQueryFileW(static_cast<HDROP>(drop), 0xffffffff, nullptr, 0) == publishedPaths.size();
         for (UINT i = 0; same && i < publishedPaths.size(); ++i) same = dropPath(drop, i) == publishedPaths[i];
         if (same && EmptyClipboard()) {
+          pasted = true;
           auto marker = GlobalAlloc(GMEM_MOVEABLE, 1);
           if (marker && !SetClipboardData(RegisterClipboardFormatW(L"Deskflow Ownership"), marker)) GlobalFree(marker);
         }
       } catch (const std::exception &) { }
       CloseClipboard();
+      if (pasted) {
+        HeadlessStatus::transfer({{"id", publishedOffer["token"]}, {"direction", "receive"}, {"state", "pasted"}});
+        if (publishedOffer["resume"].toBool()) {
+          try { fetch(publishedOffer, PastedIndex, 0, [&] { return stop.stop_requested(); }); }
+          catch (const std::exception &) { }
+        }
+      }
       publishedPaths.clear();
       continue;
     }
@@ -340,7 +498,8 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
         if (OpenClipboard(next->window)) { opened = true; break; }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
-      if (!opened) continue;
+      if (!opened) throw std::runtime_error("clipboard is busy");
+      bool published = false;
       if (!cancelled() && EmptyClipboard()) {
         auto effect = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
         auto value = effect ? static_cast<DWORD *>(GlobalLock(effect)) : nullptr;
@@ -348,6 +507,7 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
           *value = DROPEFFECT_MOVE; GlobalUnlock(effect);
           if (SetClipboardData(RegisterClipboardFormatW(L"Preferred DropEffect"), effect)) {
             if (SetClipboardData(CF_HDROP, staged.value)) {
+              published = true;
               staged.value = nullptr; cleanup.directory.clear();
               publishedWindow = next->window; publishedPaths = std::move(paths);
               auto marker = GlobalAlloc(GMEM_MOVEABLE, 1);
@@ -357,11 +517,30 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
         } else if (effect) GlobalFree(effect);
       }
       CloseClipboard();
-    } catch (const std::exception &) { OutputDebugStringW(L"ZeroFlow file clipboard transfer failed; input connection is unaffected.\n"); }
+      check(published, "clipboard publication cancelled or failed");
+      auto descriptor = QJsonDocument::fromJson(QByteArray::fromStdString(next->offer.substr(4))).object();
+      publishedOffer = descriptor;
+      HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"state", "ready"}});
+      if (descriptor["resume"].toBool()) {
+        try { fetch(descriptor, ReadyIndex, 0, [&] { return stop.stop_requested(); }); }
+        catch (const std::exception &) { /* Ready locally even if acknowledgement cannot be delivered. */ }
+      }
+    } catch (const std::exception &) {
+      auto descriptor = QJsonDocument::fromJson(QByteArray::fromStdString(next->offer.substr(4))).object();
+      HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"state", cancelled() ? "cancelled" : "failed"}});
+      OutputDebugStringW(L"ZeroFlow file clipboard transfer failed; input connection is unaffected.\n"); }
   }
 }) {}
 } // namespace
 
+void FileClipboardTransfer::configure(quint64 speedMiB, quint64 selectionMiB, quint32 files)
+{
+  check(selectionMiB <= UnlimitedBytes / ChunkBytes && speedMiB <= UnlimitedBytes / ChunkBytes && files < PastedIndex, "invalid transfer limits");
+  speedLimit = speedMiB;
+  selectionLimit = selectionMiB ? selectionMiB * ChunkBytes : UnlimitedBytes;
+  fileLimit = files ? files : PastedIndex - 1;
+  configured = true;
+}
 void FileClipboardTransfer::start() { (void)service(); }
 void FileClipboardTransfer::stop()
 {
@@ -386,7 +565,8 @@ std::string FileClipboardTransfer::offer(HANDLE drop)
   { std::lock_guard lock(s.mutex);
     if (s.current && s.current->sequence == snapshot->sequence && s.current->roots == snapshot->roots) snapshot = s.current;
     else s.current = snapshot;
-    result = {{"token", QString::fromLatin1(snapshot->token.toHex())}, {"sha256", QString::fromLatin1(s.fingerprint)}, {"hosts", hosts}}; }
+    result = {{"token", QString::fromLatin1(snapshot->token.toHex())}, {"sha256", QString::fromLatin1(s.fingerprint)}, {"hosts", hosts}, {"resume", true}, {"version", 3}, {"policy", configured.load()},
+              {"maximum", qint64(selectionLimit.load())}, {"files", qint64(fileLimit.load())}}; }
   return "ZFR1" + QJsonDocument(result).toJson(QJsonDocument::Compact).toStdString();
 }
 void FileClipboardTransfer::receiveAsync(HWND window, const std::string &offer)
@@ -401,21 +581,30 @@ HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const
   check(descriptor.starts_with("ZFR1") && descriptor.size() <= 8192, "invalid file offer");
   ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
   auto offer = QJsonDocument::fromJson(QByteArray::fromStdString(descriptor.substr(4))).object();
-  auto manifest = QJsonDocument::fromJson(fetch(offer, UINT32_MAX, Converter::MaxMetadataBytes, cancelled));
+  const auto limits = receiveLimits(offer);
+  Progress progress{offer["token"].toString(), "receive"};
+  progress.report("preparing");
+  try {
+  auto manifest = QJsonDocument::fromJson(fetch(offer, UINT32_MAX, Converter::MaxMetadataBytes, cancelled, {}, UINT32_MAX, &progress));
   check(manifest.isArray() && !manifest.array().empty(), "invalid file manifest");
   auto entries = manifest.array(); QByteArray skeleton("ZFC1"); put32(skeleton, static_cast<quint32>(entries.size()));
-  std::vector<std::pair<QString, quint32>> files; quint64 total = 0;
+  std::vector<std::pair<QString, quint64>> files; quint64 total = 0;
   for (const auto &value : entries) {
     check(value.isObject(), "invalid file entry"); auto entry = value.toObject();
     check(entry["path"].isString() && entry["directory"].isBool() && entry["size"].isDouble(), "invalid file metadata");
-    auto size = entry["size"].toDouble(); bool directory = entry["directory"].toBool();
-    check(size >= 0 && size <= Converter::MaxFileBytes && size == quint32(size) && (!directory || size == 0), "invalid file size");
+    auto size = entry["size"].toInteger(-1); bool directory = entry["directory"].toBool();
+    check(size >= 0 && quint64(size) <= limits.bytes && (!directory || size == 0), "invalid file size");
     auto name = entry["path"].toString().toUtf8(); put32(skeleton, static_cast<quint32>(name.size()));
     put32(skeleton, directory ? UINT32_MAX : 0); skeleton += name;
-    if (!directory) { total += quint32(size); files.push_back({entry["path"].toString(), quint32(size)}); }
-    check(files.size() <= Converter::MaxFiles && total <= Converter::MaxSelectionBytes, "file selection exceeds limits");
+    if (!directory) {
+      check(total <= limits.bytes && quint64(size) <= limits.bytes - total, "file selection exceeds size limit");
+      total += size; files.push_back({entry["path"].toString(), quint64(size)});
+    }
+    check(files.size() <= limits.files, "file selection exceeds file count limit");
   }
-  Drop staged{Converter().fromIClipboard(skeleton.toStdString())};
+  progress.total = total;
+  progress.report("transferring");
+  Drop staged{Converter(limits.files).fromIClipboard(skeleton.toStdString())};
   check(staged.value != nullptr, "unsafe file paths or failed staging");
   Staging cleanup{dropPath(staged.value).parent_path()};
   for (quint32 i = 0; i < files.size(); ++i) {
@@ -427,12 +616,17 @@ HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const
     BY_HANDLE_FILE_INFORMATION info{};
     check(GetFileInformationByHandle(file.value, &info) &&
           !(info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)), "staged file changed");
-    fetch(offer, i, Converter::MaxFileBytes, cancelled, [&](const QByteArray &bytes) {
+    fetch(offer, i, limits.bytes, cancelled, [&](const QByteArray &bytes) {
       DWORD written = 0;
       check(WriteFile(file.value, bytes.constData(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
             written == bytes.size(), "staged file write failed");
-    }, files[i].second);
+    }, files[i].second, &progress);
   }
   check(!cancelled(), "file transfer cancelled");
+  progress.report("staged");
   auto result = staged.value; staged.value = nullptr; cleanup.directory.clear(); return result;
+  } catch (const std::exception &) {
+    progress.report(cancelled() ? "cancelled" : "failed");
+    throw;
+  }
 }

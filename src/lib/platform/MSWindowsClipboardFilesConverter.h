@@ -24,6 +24,7 @@ private:
 class MSWindowsClipboardFilesConverter : public IMSWindowsClipboardConverter
 {
 public:
+  explicit MSWindowsClipboardFilesConverter(size_t maxFiles = 128) : m_maxFiles(maxFiles) {}
   static constexpr size_t MaxSelectionBytes = 384 * 1024 * 1024;
   static constexpr size_t MaxFileBytes = MaxSelectionBytes;
   static constexpr size_t MaxMetadataBytes = 3 * 1024 * 1024;
@@ -35,4 +36,6 @@ public:
   UINT getWin32Format() const override { return CF_HDROP; }
   HANDLE fromIClipboard(const std::string &data) const override;
   std::string toIClipboard(HANDLE data) const override;
+private:
+  size_t m_maxFiles;
 };

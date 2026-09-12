@@ -15,7 +15,7 @@ The portable Windows x64 runtime is one executable, approximately 15 MB. It does
 - Headless server and client modes in the same executable.
 - Keyboard and mouse sharing between screens.
 - Text and image clipboard sharing over the main connection, limited to 3 MiB by default. Oversized clipboard transfers are discarded without disconnecting input.
-- File and folder clipboard sharing, limited to **384 MiB total per selection and 128 regular files**, including nested folders and empty folders. Any combination within those limits is supported.
+- File and folder clipboard sharing with defaults of **384 MiB per selection and 128 regular files**, including nested and empty folders. Supervisors can raise either limit; 0 removes that user cap. File sizes and resume offsets use 64-bit values.
 - TLS connections, with automatic acceptance and storage of peer fingerprints.
 - Local-network ZeroFlow discovery and automatic placement of newly connected screens in the server layout.
 - Optional JSON status/heartbeat output and a stdin command for graceful shutdown.
@@ -24,11 +24,15 @@ This fork does **not** provide a GUI, tray controls, graphical screen-layout edi
 
 ## File clipboard
 
-Version 1.2 adds file and folder sharing. Update both computers to use it. Copy a selection, then move the shared pointer to the receiving computer. Files transfer in the background over a separate TLS connection using 1 MiB buffers, with a 16 ms pause after every 64 MiB sent. File contents are streamed directly to disk rather than loaded as a whole selection into memory. Input and text/image clipboard traffic retain their existing connection and limits.
+Version 1.3 adds resumable transfers, configurable speed/size/file-count limits, transfer status, and double-Insert emergency return. Update both computers to use the new transfer controls. Copy a selection, then move the shared pointer to the receiving computer. Files transfer in the background over a separate TLS connection using 1 MiB buffers, with a 16 ms pause after every 64 MiB sent. File contents are streamed directly to disk rather than loaded as a whole selection into memory. Input and text/image clipboard traffic retain their existing connection and limits.
 
 The receiver stages the complete selection under a fresh `ZeroFlow-Clipboard-<id>` directory in the interactive user's ordinary Windows temp folder. Paste becomes available only after the entire selection arrives. Windows Explorer is asked to **move** the staged files to the paste destination; sender originals remain untouched. After all staged roots have been moved away, ZeroFlow clears that received file clipboard without clearing a newer copy. Applications that ignore Windows' preferred move action may copy instead, leaving the staged files and clipboard available.
 
-Unpasted successful transfers are left for normal temp cleanup; Windows does not guarantee a particular cleanup time. Failed or cancelled transfers remove their incomplete staging. Invalid paths, linked/reparse-point files, offline files, oversized selections, and selections exceeding 128 regular files are rejected. A file-transfer failure does not close the keyboard/mouse connection.
+Unpasted successful transfers are left for normal temp cleanup; Windows does not guarantee a particular cleanup time. Failed or cancelled transfers remove their incomplete staging. Invalid paths, linked/reparse-point files, offline files, and selections exceeding the configured limits are rejected. Path metadata remains bounded to 3 MiB. A file-transfer failure does not close the keyboard/mouse connection.
+
+The receiver reconnects up to three times after a file-channel failure, resuming at the first chunk that was not completely staged. TLS provides transport integrity, and a source whose identity, size or modification time changes during retry is rejected. Older senders are retried from the start with already-staged bytes discarded. Neither a retry nor a transfer limit restarts input sharing.
+
+Tap **Insert twice within 500 ms** on the host keyboard to return the pointer and keyboard to the host, clear the screen lock, and end relative mouse capture. Key repeats do not trigger it; single Insert retains its normal behavior. Normal screen crossings remain available afterward.
 
 Automatic trust is intended for a trusted local network. It is not an authenticated public-internet pairing workflow. An upstream Deskflow peer still uses its own certificate approval and screen-layout configuration. The connection protocol is based on Deskflow; interoperability with a current stock Deskflow build still needs a dedicated test.
 
@@ -59,6 +63,10 @@ Start the executable without a console window and redirect its standard handles:
 
 - --status-json emits newline-delimited JSON on stdout. A heartbeat is produced every two seconds by the input event loop.
 - --control-stdin accepts {"command":"stop"} followed by a newline. Closing stdin also requests shutdown.
+- {"command":"transfer-limits","speedMiB":0,"selectionMiB":384,"files":128} applies saved supervisor limits without restarting input. Zero removes the corresponding user cap. A managed companion advertises its policy to an updated unmanaged peer, so its controls apply in either direction. The default standalone policy is 384 MiB and 128 files.
+- {"command":"screen-layout","request":"unique-request-id","lanes":{"up":[],"down":[],"left":[],"right":["handheld-1","handheld-2"]}} persists and applies a cardinal layout. Include every configured client exactly once, ordered outward from the host. Offline intermediate screens are skipped by the existing traversal. Layout updates replace only links and keep the live input hooks.
+- Transfer records use type "transfer" with id, direction, state, bytes, total, bytesPerSecond, retries and file. States include preparing, transferring, retrying, staged, sent, ready, pasted, cancelled and failed. Ready means the receiving Windows clipboard was published, not just that bytes were sent.
+- Heartbeats also retain sending/receiving snapshots, connectedClients, and the current layout plus its last save result. Transfer messages do not advance the event-loop heartbeat sequence.
 - stderr contains connection-established messages, warnings, and failures. Routine screen crossings and successful heartbeat messages are not logged there.
 
 Example status record:
@@ -96,6 +104,8 @@ The historical CMake target name is zeroflow-core; its output is ZeroFlow.exe. L
 Two-machine testing has confirmed repeated keyboard/mouse crossings between a desktop and an MSI Claw, with no unwanted clicks or disconnects in the final test. Secure-desktop behavior and stock Deskflow interoperability require their own validation.
 
 Version 1.2 was also tested with clipboard transfers from an MSI Claw to a desktop: 128 files totaling 371.2 MiB staged in approximately 7 seconds, and one 383 MiB file in approximately 4.1 seconds. SHA-256 hashes matched before and after paste, staged files moved out of temp, and clipboard clearing was observed. Input heartbeats continued and the user reported no loss of control while crossing screens during the folder transfer. These timings describe that network, not a guaranteed transfer rate.
+
+Version 1.3 validation includes a generated file of 4 GiB + 4 MiB + 123 bytes, with a forced TLS disconnect and successful resume beyond the 4 GiB offset. SHA-256 hashes matched. A 256-file selection also passed with raised limits. These are isolated local transfer tests; whole-game transfers on physical devices remain a separate user test.
 
 ## Attribution and license
 

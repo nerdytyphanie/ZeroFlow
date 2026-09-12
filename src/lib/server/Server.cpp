@@ -10,6 +10,8 @@
 
 #include "base/IEventQueue.h"
 #include "base/Log.h"
+#include "base/HeadlessStatus.h"
+#include <QJsonArray>
 #include "deskflow/AppUtil.h"
 #include "deskflow/DeskflowException.h"
 #include "deskflow/IPlatformScreen.h"
@@ -125,6 +127,24 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
     m_primaryClient->fakeInputEnd();
   });
 
+  m_events->addHandler(EventTypes::PrimaryScreenEmergencyReturn, m_primaryClient->getEventTarget(), [this](const auto &) {
+    m_keyboardBroadcasting = false;
+    m_lockedToScreen = false;
+    stopSwitch();
+    stopRelativeMoves();
+    if (m_active != m_primaryClient)
+      for (ButtonID button = kButtonLeft; button <= kButtonExtra1; ++button) m_active->mouseUp(button);
+    int32_t x, y, width, height;
+    m_primaryClient->getShape(x, y, width, height);
+    switchScreen(m_primaryClient, x + width / 2, y + height / 2, false);
+    m_primaryClient->reconfigure(getActivePrimarySides());
+    LOG_PRINT("ZeroFlow: double Insert returned control to the host");
+  });
+
+  m_events->addHandler(EventTypes::ServerLayoutConfigure, m_events->getSystemTarget(), [this](const auto &event) {
+    applyLayout(static_cast<const ScreenLayoutInfo *>(event.getData())->value);
+  });
+
   // add connection
   addClient(m_primaryClient);
 
@@ -150,6 +170,7 @@ Server::~Server()
 {
   // remove event handlers and timers
   using enum EventTypes;
+  m_events->removeHandler(ServerLayoutConfigure, m_events->getSystemTarget());
   m_events->removeHandler(KeyStateKeyDown, m_inputFilter);
   m_events->removeHandler(KeyStateKeyUp, m_inputFilter);
   m_events->removeHandler(KeyStateKeyRepeat, m_inputFilter);
@@ -157,6 +178,7 @@ Server::~Server()
   m_events->removeHandler(PrimaryScreenButtonUp, m_inputFilter);
   m_events->removeHandler(PrimaryScreenMotionOnPrimary, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenMotionOnSecondary, m_primaryClient->getEventTarget());
+  m_events->removeHandler(PrimaryScreenEmergencyReturn, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenWheel, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenSaverActivated, m_primaryClient->getEventTarget());
   m_events->removeHandler(PrimaryScreenSaverDeactivated, m_primaryClient->getEventTarget());
@@ -220,6 +242,8 @@ bool Server::setConfig(const ServerConfig &config)
     rule.adoptAction(new InputFilter::LockCursorToScreenAction(m_events), true);
     m_inputFilter->addFilterRule(rule);
   }
+
+  publishLayout();
 
   // tell primary screen about reconfiguration
   m_primaryClient->reconfigure(getActivePrimarySides());
@@ -298,6 +322,7 @@ void Server::adoptClient(BaseClientProxy *client)
     m_config->addScreen(name);
     m_config->connect(placedAnchor, placedDirection, 0, 1, name, 0, 1);
     m_config->connect(name, placedOpposite, 0, 1, placedAnchor, 0, 1);
+    publishLayout();
     LOG_INFO("automatically assigned screen %s", name.c_str());
   }
 
@@ -2105,4 +2130,76 @@ void Server::forceLeaveClient(const BaseClientProxy *client)
 
   // tell primary client about the active sides
   m_primaryClient->reconfigure(getActivePrimarySides());
+}
+
+void Server::publishLayout(const QString &result, const QString &request)
+{
+  QJsonObject lanes;
+  for (auto direction : {Direction::Top, Direction::Bottom, Direction::Left, Direction::Right}) {
+    QJsonArray names;
+    std::set<std::string> visited{m_primaryClient->getName()};
+    auto name = m_primaryClient->getName();
+    for (;;) {
+      name = m_config->getNeighbor(name, direction, .5f, nullptr);
+      if (name.empty() || !visited.insert(name).second) break;
+      names.append(QString::fromStdString(name));
+    }
+    lanes[Config::dirName(direction)] = names;
+  }
+  QJsonArray screens, connected;
+  for (auto it = m_config->begin(); it != m_config->end(); ++it) screens.append(QString::fromStdString(*it));
+  for (const auto &[name, client] : m_clients) connected.append(QString::fromStdString(name));
+  HeadlessStatus::layout({{"host", QString::fromStdString(m_primaryClient->getName())}, {"screens", screens},
+    {"connected", connected}, {"lanes", lanes}, {"result", result}, {"request", request}});
+}
+
+void Server::applyLayout(const QJsonObject &value)
+{
+  const auto request = value["request"].toString().left(64);
+  try {
+    auto require = [](bool ok, const char *reason) { if (!ok) throw std::runtime_error(reason); };
+    require(value["lanes"].isObject(), "Invalid screen layout");
+    const auto lanes = value["lanes"].toObject();
+    std::set<std::string> placed{m_primaryClient->getName()};
+    struct Link { std::string from, to; Direction direction; };
+    std::vector<Link> links;
+    for (auto direction : {Direction::Top, Direction::Bottom, Direction::Left, Direction::Right}) {
+      auto lane = lanes[Config::dirName(direction)];
+      require(lane.isArray(), "Missing screen lane");
+      auto previous = m_primaryClient->getName();
+      const auto opposite = direction == Direction::Top ? Direction::Bottom : direction == Direction::Bottom ? Direction::Top :
+        direction == Direction::Left ? Direction::Right : Direction::Left;
+      for (const auto &item : lane.toArray()) {
+        auto name = item.toString().toStdString();
+        require(!name.empty() && m_config->isScreen(name) && placed.insert(name).second, "Unknown or duplicate screen");
+        links.push_back({previous, name, direction}); links.push_back({name, previous, opposite}); previous = name;
+      }
+    }
+    for (auto it = m_config->begin(); it != m_config->end(); ++it)
+      require(placed.contains(*it), "Device list changed; refresh and arrange all devices");
+    // Parse a detached config; never replace the live input filter or its hooks.
+    QFile source(Settings::serverConfigFile());
+    require(source.open(QIODevice::ReadOnly), "Could not read screen layout");
+    auto original = QString::fromUtf8(source.readAll()); source.close();
+    ServerConfig next(m_events); std::istringstream input(original.toStdString()); input >> next;
+    for (const auto &name : placed) {
+      require(next.isScreen(name), "Device list changed; refresh the layout");
+      for (auto direction : {Direction::Top, Direction::Bottom, Direction::Left, Direction::Right}) next.disconnect(name, direction);
+    }
+    for (const auto &link : links) require(next.connect(link.from, link.direction, 0, 1, link.to, 0, 1), "Invalid screen link");
+    std::ostringstream output; output << next;
+    const QRegularExpression expression("(?ms)^section:[ \t]*links[ \t]*\r?\n.*?^end[ \t]*(?:\r?\n|$)");
+    auto replacement = expression.match(QString::fromStdString(output.str())).captured();
+    require(!replacement.isEmpty(), "Could not encode screen links");
+    auto old = expression.match(original);
+    if (old.hasMatch()) original.replace(old.capturedStart(), old.capturedLength(), replacement);
+    else original += "\n" + replacement;
+    auto bytes = original.toUtf8(); QSaveFile file(Settings::serverConfigFile());
+    require(file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit(), "Could not save screen layout");
+    for (const auto &name : placed)
+      for (auto direction : {Direction::Top, Direction::Bottom, Direction::Left, Direction::Right}) m_config->disconnect(name, direction);
+    for (const auto &link : links) m_config->connect(link.from, link.direction, 0, 1, link.to, 0, 1);
+    stopSwitch(); m_primaryClient->reconfigure(getActivePrimarySides());
+    publishLayout("saved", request);
+  } catch (const std::exception &error) { publishLayout(QString::fromUtf8(error.what()), request); }
 }

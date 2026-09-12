@@ -13,6 +13,7 @@
 #include "common/Settings.h"
 #include "deskflow/ClientApp.h"
 #include "deskflow/ServerApp.h"
+#include "server/Server.h"
 #include "deskflow/ipc/CoreIpcServer.h"
 #include "net/SecureUtils.h"
 #include "platform/FileClipboardTransfer.h"
@@ -142,7 +143,9 @@ int main(int argc, char **argv)
     if (core) core->quit(); else app.quit();
   };
   std::unique_ptr<HeadlessControl> control;
-  if (parser.isSet("control-stdin")) control = std::make_unique<HeadlessControl>(stop);
+  if (parser.isSet("control-stdin")) control = std::make_unique<HeadlessControl>(stop, [&](const QJsonObject &layout) {
+    if (server) events.addEvent(Event(EventTypes::ServerLayoutConfigure, events.getSystemTarget(), new Server::ScreenLayoutInfo(layout)));
+  });
   QUdpSocket discovery;
   QTimer discoveryTimer;
   if (server) {

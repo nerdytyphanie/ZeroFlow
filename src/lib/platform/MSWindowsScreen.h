@@ -248,6 +248,9 @@ private:
   static HINSTANCE s_windowInstance;
 
   // true if screen is being used as a primary screen, false otherwise
+  ULONGLONG m_insertPressedAt = 0;
+  bool m_insertHeld = false;
+  bool m_swallowInsertRelease = false;
   bool m_isPrimary;
 
   // true if hooks are not to be installed (useful for debugging)

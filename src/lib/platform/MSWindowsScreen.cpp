@@ -1073,6 +1073,25 @@ bool MSWindowsScreen::onKey(WPARAM wParam, LPARAM lParam)
   KeyModifierMask state = pollActiveModifiers();
   m_keyState->onKey(button, down, state);
 
+  // Detect physical presses before configured hotkeys consume them. Repeats
+  // never count as a second press; keep the matching release out of the host.
+  if (m_isPrimary && ((wParam >> 16) & 0xffu) == VK_INSERT) {
+    if (!down) {
+      m_insertHeld = false;
+      if (m_swallowInsertRelease) { m_swallowInsertRelease = false; return true; }
+    } else if (!m_insertHeld && !(lParam & 0x40000000u)) {
+      m_insertHeld = true;
+      auto now = GetTickCount64();
+      if (m_insertPressedAt && now - m_insertPressedAt <= 500) {
+        m_insertPressedAt = 0;
+        m_swallowInsertRelease = true;
+        m_events->addEvent(Event(EventTypes::PrimaryScreenEmergencyReturn, getEventTarget()));
+        return true;
+      }
+      m_insertPressedAt = now;
+    } else if (m_swallowInsertRelease) return true;
+  } else if (down) m_insertPressedAt = 0;
+
   // check for hot keys
   if (oldState != state) {
     // modifier key was pressed/released

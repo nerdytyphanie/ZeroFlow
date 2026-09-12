@@ -18,6 +18,7 @@
 #include "server/Config.h"
 
 #include <climits>
+#include <QJsonObject>
 #include <map>
 #include <set>
 #include <vector>
@@ -42,6 +43,11 @@ class Server
   using ServerConfig = deskflow::server::Config;
 
 public:
+  class ScreenLayoutInfo : public EventData {
+  public:
+    QJsonObject value;
+    explicit ScreenLayoutInfo(QJsonObject value) : value(std::move(value)) {}
+  };
   //! Lock cursor to screen data
   class LockCursorToScreenInfo : public EventData
   {
@@ -307,6 +313,8 @@ private:
   void handleShapeChanged(BaseClientProxy *client);
   void handleClipboardGrabbed(const Event &event, BaseClientProxy *client);
   void handleClipboardChanged(const Event &event, BaseClientProxy *client);
+  void publishLayout(const QString &result = {}, const QString &request = {});
+  void applyLayout(const QJsonObject &value);
   void handleKeyDownEvent(const Event &event);
   void handleKeyUpEvent(const Event &event);
   void handleKeyRepeatEvent(const Event &event);

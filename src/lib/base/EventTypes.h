@@ -154,6 +154,7 @@ enum class EventTypes : uint32_t
   /// This event is sent when the computer has been switched to a client.
   ServerScreenSwitched,
 
+  ServerLayoutConfigure,
   ServerAppReloadConfig,
   ServerAppForceReconnect,
   ServerAppResetServer,
@@ -195,6 +196,9 @@ enum class EventTypes : uint32_t
 
   /// This event is sent when hotkey is up. Event data is a pointer to HotKeyInfo.
   PrimaryScreenHotkeyUp,
+
+  /// Physical double Insert requests an immediate return to the primary screen.
+  PrimaryScreenEmergencyReturn,
 
   /// This event is sent when fake input begins.
   PrimaryScreenFakeInputBegin,

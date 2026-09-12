@@ -2,10 +2,12 @@
 #pragma once
 #include "platform/MSWindowsClipboard.h"
 #include <functional>
+#include <QtGlobal>
 
 // File bytes never use the input connection. Only an ephemeral, TLS-pinned offer
 // is carried by its existing clipboard protocol.
 namespace FileClipboardTransfer {
+void configure(quint64 speedMiB, quint64 selectionMiB, quint32 files = 128);
 void start();
 void stop();
 void cancelReceive();

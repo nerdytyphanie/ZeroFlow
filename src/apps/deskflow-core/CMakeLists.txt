@@ -16,7 +16,15 @@ if(WIN32)
   # Generate rc file
   set(EXE_DESCRIPTION "ZeroFlow")
   set(EXE_ICON "IDI_ZEROFLOW ICON DISCARDABLE \"${CMAKE_SOURCE_DIR}/src/apps/res/zeroflow-embedded.ico\"")
-  configure_file(${CMAKE_SOURCE_DIR}/src/apps/res/windows.rc.in ${target}.rc)
+  # Release identity is independent of the inherited Deskflow protocol version.
+  block()
+    set(CMAKE_PROJECT_VERSION_MAJOR 1)
+    set(CMAKE_PROJECT_VERSION_MINOR 3)
+    set(CMAKE_PROJECT_VERSION_PATCH 0)
+    set(CMAKE_PROJECT_VERSION_TWEAK 0)
+    set(CMAKE_PROJECT_VERSION "1.3.0.0")
+    configure_file(${CMAKE_SOURCE_DIR}/src/apps/res/windows.rc.in ${target}.rc)
+  endblock()
 
   target_sources(${target} PRIVATE
     deskflow-core.exe.manifest

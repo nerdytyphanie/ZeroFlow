@@ -120,7 +120,7 @@ bool safePath(const std::wstring &path)
 }
 struct Entry { std::wstring name; std::string_view contents; bool directory; };
 
-bool decode(std::string_view data, std::vector<Entry> &entries)
+bool decode(std::string_view data, std::vector<Entry> &entries, size_t maxFiles)
 {
   if (data.size() > MSWindowsClipboardFilesConverter::MaxPayloadBytes || !data.starts_with("ZFC1")) return false;
   data.remove_prefix(4);
@@ -135,7 +135,7 @@ bool decode(std::string_view data, std::vector<Entry> &entries)
     if (!take32(data, nameSize) || !take32(data, fileSize) || nameSize > 120000 || nameSize > data.size()) return false;
     bool directory = fileSize == UINT32_MAX;
     if (directory) fileSize = 0;
-    else if (++files > MSWindowsClipboardFilesConverter::MaxFiles || fileSize > MSWindowsClipboardFilesConverter::MaxFileBytes) return false;
+    else if (++files > maxFiles || fileSize > MSWindowsClipboardFilesConverter::MaxFileBytes) return false;
     total += fileSize;
     if (total > MSWindowsClipboardFilesConverter::MaxSelectionBytes) return false;
     if (fileSize > data.size() - nameSize) return false;
@@ -213,7 +213,7 @@ std::string MSWindowsClipboardFilesConverter::toIClipboard(HANDLE data) const
 HANDLE MSWindowsClipboardFilesConverter::fromIClipboard(const std::string &data) const
 {
   std::vector<Entry> entries;
-  if (!decode(data, entries)) return nullptr;
+  if (!decode(data, entries, m_maxFiles)) return nullptr;
   ClipboardDesktopUser desktop;
   if (!desktop.valid) return nullptr;
   auto temp = desktop.temp();
