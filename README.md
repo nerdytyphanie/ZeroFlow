@@ -24,11 +24,9 @@ This fork does **not** provide a GUI, tray controls, graphical screen-layout edi
 
 ## File clipboard
 
-Version 1.3.3 fixes file capture in the Windows service client. Explorer can expose a file selection to the signed-in user's processes while reporting no clipboard formats to the SYSTEM input worker, even during impersonation. A hidden helper running as that user captures the selection and clears it after a matching paste acknowledgement. The existing SYSTEM worker still handles input, and the existing TLS file channel still transfers the data. The helper uses private inherited pipes and a disposable executable copy in the user's temp directory; it opens no additional network port. Existing Winhanced and companion startup updaters can fetch this release without application changes.
+Copy a selection, then move the shared pointer to the receiving computer. Files transfer in the background over a separate TLS connection using 1 MiB buffers, with a 16 ms pause after every 64 MiB sent. Transfers support configurable speed, selection-size and file-count limits, progress reporting, and automatic retries. File contents are streamed directly to disk rather than loaded as a whole selection into memory. Input and text/image clipboard traffic retain their existing connection and limits.
 
-Version 1.3 adds resumable transfers, configurable speed/size/file-count limits, transfer status, and double-Insert emergency return. Update both computers to use the new transfer controls. Copy a selection, then move the shared pointer to the receiving computer. Files transfer in the background over a separate TLS connection using 1 MiB buffers, with a 16 ms pause after every 64 MiB sent. File contents are streamed directly to disk rather than loaded as a whole selection into memory. Input and text/image clipboard traffic retain their existing connection and limits.
-
-The receiver stages the complete selection under a fresh `ZeroFlow-Clipboard-<id>` directory in the interactive user's ordinary Windows temp folder. Paste becomes available only after the entire selection arrives. Windows Explorer is asked to **move** the staged files to the paste destination; sender originals remain untouched. After all staged roots have been moved away, ZeroFlow clears that received file clipboard without clearing a newer copy. Starting with 1.3.2, the paste acknowledgement also clears the sender's matching original clipboard selection and retires its transfer offer. A newer copy on either computer is preserved, including a fresh copy of the same source paths. Completion acknowledgements use the existing bounded connection retries and are safe to repeat. Update ZeroFlow on both computers for this behavior in either direction; existing Winhanced and companion applications can use their startup updaters. Applications that ignore Windows' preferred move action may copy instead, leaving the staged files and clipboard available. This completion handling applies to file/folder transfers, not general text or image pastes.
+The receiver stages the complete selection under a fresh `ZeroFlow-Clipboard-<id>` directory in the interactive user's ordinary Windows temp folder. Paste becomes available only after the entire selection arrives. Windows Explorer is asked to **move** the staged files to the paste destination; sender originals remain untouched. After all staged roots have been moved away, ZeroFlow clears that received file clipboard without clearing a newer copy. The paste acknowledgement also clears the sender's matching original clipboard selection and retires its transfer offer. A newer copy on either computer is preserved, including a fresh copy of the same source paths. Completion acknowledgements use the existing bounded connection retries and are safe to repeat. Applications that ignore Windows' preferred move action may copy instead, leaving the staged files and clipboard available. This completion handling applies to file/folder transfers, not general text or image pastes.
 
 Unpasted successful transfers are left for normal temp cleanup; Windows does not guarantee a particular cleanup time. Failed or cancelled transfers remove their incomplete staging. Invalid paths, linked/reparse-point files, offline files, and selections exceeding the configured limits are rejected. Path metadata remains bounded to 3 MiB. A file-transfer failure does not close the keyboard/mouse connection.
 
@@ -65,7 +63,7 @@ Start the executable without a console window and redirect its standard handles:
 
 - --status-json emits newline-delimited JSON on stdout. A heartbeat is produced every two seconds by the input event loop.
 - --control-stdin accepts {"command":"stop"} followed by a newline. Closing stdin also requests shutdown.
-- {"command":"transfer-limits","speedMiB":0,"selectionMiB":384,"files":128} applies saved supervisor limits without restarting input. Zero removes the corresponding user cap. A managed companion advertises its policy to an updated unmanaged peer, so its controls apply in either direction. The default standalone policy is 384 MiB and 128 files.
+- {"command":"transfer-limits","speedMiB":0,"selectionMiB":384,"files":128} applies saved supervisor limits without restarting input. Zero removes the corresponding user cap. A supervised peer advertises its policy to an unmanaged peer, so its controls apply in either direction. The default standalone policy is 384 MiB and 128 files.
 - {"command":"screen-layout","request":"unique-request-id","lanes":{"up":[],"down":[],"left":[],"right":["handheld-1","handheld-2"]}} persists and applies a cardinal layout. Include every configured client exactly once, ordered outward from the host. Offline intermediate screens are skipped by the existing traversal. Layout updates replace only links and keep the live input hooks.
 - Transfer records use type "transfer" with id, direction, state, bytes, total, bytesPerSecond, retries and file. States include preparing, transferring, retrying, staged, sent, ready, pasted, cancelled and failed. Ready means the receiving Windows clipboard was published, not just that bytes were sent.
 - Heartbeats also retain sending/receiving snapshots, connectedClients, and the current layout plus its last save result. Transfer messages do not advance the event-loop heartbeat sequence.
@@ -83,13 +81,13 @@ peers counts the server's attached clients. A client's connection is represented
 
 ## Windows service mode
 
-Version 1.1 adds --service to the same executable. Install it as a LocalSystem Windows service named **ZeroFlow Embedded**, with --client, --host and an absolute --settings path in its service command line. Service installation requires administrator authority; ZeroFlow does not display an elevation prompt itself.
+Use --service to run the executable as a LocalSystem Windows service named **ZeroFlow Embedded**, with --client, --host and an absolute --settings path in its service command line. Service installation requires administrator authority; ZeroFlow does not display an elevation prompt itself.
 
 The service stays in Session 0 and starts a SYSTEM input worker in the active interactive session. The worker is the same executable. Stopping the service stops the worker; session changes move it to the active session. Automatic versus Manual startup is configured through Windows Service Control Manager.
 
-The service watches a private local named pipe. Advancing event-loop heartbeats refresh a ten-second deadline, with thirty seconds of startup/resume grace. Process exits are detected immediately; failures restart with backoff. A healthy client waiting for its server is not restarted. The worker is assigned to a job that closes it if its service exits.
+A hidden helper running as the signed-in user captures Explorer's file clipboard and clears the matching selection after a remote paste. It communicates through private inherited pipes and uses a disposable executable copy in the user's temp directory. Keyboard and mouse input remain in the SYSTEM worker; file data uses the existing TLS transfer channel without an additional network port.
 
-Release 1.0.0 supports only direct process operation. Use 1.1 or later for service mode.
+The service watches a private local named pipe. Advancing event-loop heartbeats refresh a ten-second deadline, with thirty seconds of startup/resume grace. Process exits are detected immediately; failures restart with backoff. A healthy client waiting for its server is not restarted. The worker is assigned to a job that closes it if its service exits.
 
 ## Build
 
@@ -101,13 +99,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/
 cmake --build build --config Release --target zeroflow-core
 ```
 
-The historical CMake target name is zeroflow-core; its output is ZeroFlow.exe. Local validation tests are not distributed in this repository, source archives, or runtime.
-
-Two-machine testing has confirmed repeated keyboard/mouse crossings between a desktop and an MSI Claw, with no unwanted clicks or disconnects in the final test. Secure-desktop behavior and stock Deskflow interoperability require their own validation.
-
-Version 1.2 was also tested with clipboard transfers from an MSI Claw to a desktop: 128 files totaling 371.2 MiB staged in approximately 7 seconds, and one 383 MiB file in approximately 4.1 seconds. SHA-256 hashes matched before and after paste, staged files moved out of temp, and clipboard clearing was observed. Input heartbeats continued and the user reported no loss of control while crossing screens during the folder transfer. These timings describe that network, not a guaranteed transfer rate.
-
-Version 1.3 validation includes a generated file of 4 GiB + 4 MiB + 123 bytes, with a forced TLS disconnect and successful resume beyond the 4 GiB offset. SHA-256 hashes matched. A 256-file selection also passed with raised limits. These are isolated local transfer tests; whole-game transfers on physical devices remain a separate user test.
+The CMake target name is zeroflow-core; its output is ZeroFlow.exe. Local validation tests are not distributed in this repository, source archives, or runtime.
 
 ## Attribution and license
 
