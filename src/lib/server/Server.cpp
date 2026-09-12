@@ -142,7 +142,7 @@ Server::Server(ServerConfig &config, PrimaryClient *primaryClient, deskflow::Scr
   });
 
   m_events->addHandler(EventTypes::ServerLayoutConfigure, m_events->getSystemTarget(), [this](const auto &event) {
-    applyLayout(static_cast<const ScreenLayoutInfo *>(event.getData())->value);
+    applyLayout(static_cast<const ScreenLayoutInfo *>(event.getDataObject())->value);
   });
 
   // add connection

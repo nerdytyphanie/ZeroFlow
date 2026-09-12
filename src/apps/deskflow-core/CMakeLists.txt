@@ -20,9 +20,9 @@ if(WIN32)
   block()
     set(CMAKE_PROJECT_VERSION_MAJOR 1)
     set(CMAKE_PROJECT_VERSION_MINOR 3)
-    set(CMAKE_PROJECT_VERSION_PATCH 0)
+    set(CMAKE_PROJECT_VERSION_PATCH 1)
     set(CMAKE_PROJECT_VERSION_TWEAK 0)
-    set(CMAKE_PROJECT_VERSION "1.3.0.0")
+    set(CMAKE_PROJECT_VERSION "1.3.1.0")
     configure_file(${CMAKE_SOURCE_DIR}/src/apps/res/windows.rc.in ${target}.rc)
   endblock()
 
@@ -55,4 +55,3 @@ target_link_libraries(
 set_target_properties(${target} PROPERTIES WIN32_EXECUTABLE TRUE OUTPUT_NAME "ZeroFlow")
 target_link_options(${target} PRIVATE /ENTRY:mainCRTStartup)
 install(TARGETS ${target} RUNTIME DESTINATION .)
-
