@@ -17,6 +17,7 @@
 #include "deskflow/ipc/CoreIpcServer.h"
 #include "net/SecureUtils.h"
 #include "platform/FileClipboardTransfer.h"
+#include "platform/ClipboardUserBridge.h"
 #include <QCoreApplication>
 #include <QCommandLineParser>
 #include <QFileInfo>
@@ -35,6 +36,8 @@
 
 int main(int argc, char **argv)
 {
+  int clipboardResult = ClipboardUserBridge::dispatch(argc, argv);
+  if (clipboardResult != -1) return clipboardResult;
   int serviceResult = dispatchWindowsService(argc, argv);
   if (serviceResult != -1) return serviceResult;
   ArchMiscWindows::setInstanceWin32(GetModuleHandle(nullptr));

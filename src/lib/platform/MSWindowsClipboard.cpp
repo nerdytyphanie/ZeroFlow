@@ -13,6 +13,7 @@
 #include "platform/MSWindowsClipboardFacade.h"
 #include "platform/MSWindowsClipboardFilesConverter.h"
 #include "platform/FileClipboardTransfer.h"
+#include "platform/ClipboardUserBridge.h"
 #include "platform/MSWindowsClipboardHTMLConverter.h"
 #include "platform/MSWindowsClipboardUTF16Converter.h"
 #include <oleidl.h>
@@ -38,6 +39,7 @@ MSWindowsClipboard::MSWindowsClipboard(HWND window)
 
 MSWindowsClipboard::~MSWindowsClipboard()
 {
+  if (m_userFiles) GlobalFree(m_userFiles);
   clearConverters();
 
   // dependency injection causes confusion over ownership, so we need
@@ -45,6 +47,12 @@ MSWindowsClipboard::~MSWindowsClipboard()
   // be a more elegant way of doing this.
   if (m_deleteFacade)
     delete m_facade;
+}
+
+void MSWindowsClipboard::captureUserFiles()
+{
+  if (m_userFiles) GlobalFree(m_userFiles);
+  m_userFiles = ClipboardUserBridge::readFiles(m_userSequence);
 }
 
 void MSWindowsClipboard::setFacade(IMSWindowsClipboardFacade &facade)
@@ -163,6 +171,8 @@ IClipboard::Time MSWindowsClipboard::getTime() const
 
 bool MSWindowsClipboard::has(Format format) const
 {
+  if (m_userFiles && GetClipboardSequenceNumber() == m_userSequence)
+    return format == Format::Files;
   // File selections have one bounded payload, not additional shell text/image formats.
   if (IsClipboardFormatAvailable(CF_HDROP) && format != Format::Files)
     return false;
@@ -179,6 +189,8 @@ bool MSWindowsClipboard::has(Format format) const
 
 std::string MSWindowsClipboard::get(Format format) const
 {
+  if (format == Format::Files && m_userFiles && GetClipboardSequenceNumber() == m_userSequence)
+    return FileClipboardTransfer::offer(m_userFiles, m_window);
   // find the converter for the first clipboard format we can handle
   IMSWindowsClipboardConverter *converter = nullptr;
   for (ConverterList::const_iterator index = m_converters.begin(); index != m_converters.end(); ++index) {

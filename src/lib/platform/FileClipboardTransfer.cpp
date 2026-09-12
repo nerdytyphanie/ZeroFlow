@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 #include "platform/FileClipboardTransfer.h"
+#include "platform/ClipboardUserBridge.h"
 #include "base/HeadlessStatus.h"
 #include "platform/MSWindowsClipboardFilesConverter.h"
 #include <shellapi.h>
@@ -175,6 +176,10 @@ struct Snapshot {
 };
 void clearSourceClipboard(const Snapshot &snapshot, const std::function<bool()> &cancelled)
 {
+  if (ClipboardUserBridge::required()) {
+    networkCheck(ClipboardUserBridge::clearFiles(snapshot.sequence), "source clipboard helper unavailable");
+    return;
+  }
   // A newer copy, even of the same paths, belongs to the user and must survive.
   if (GetClipboardSequenceNumber() != snapshot.sequence) return;
   bool opened = false;
@@ -587,6 +592,7 @@ void FileClipboardTransfer::stop()
 {
   auto &s = service(); s.generation++; s.receiver.request_stop(); s.work.notify_all(); s.server.request_stop();
   if (s.receiver.joinable()) s.receiver.join(); if (s.server.joinable()) s.server.join();
+  ClipboardUserBridge::stop();
 }
 void FileClipboardTransfer::cancelReceive() { service().generation++; }
 std::string FileClipboardTransfer::offer(HANDLE drop, HWND window)

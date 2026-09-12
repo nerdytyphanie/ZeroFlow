@@ -419,6 +419,9 @@ void *MSWindowsScreen::getEventTarget() const
 bool MSWindowsScreen::getClipboard(ClipboardID, IClipboard *dst) const
 {
   MSWindowsClipboard src(m_window);
+  // Capture before taking Windows' global clipboard lock: the user helper
+  // needs to open Explorer's clipboard in its own process.
+  src.captureUserFiles();
   Clipboard::copy(dst, &src);
   return true;
 }

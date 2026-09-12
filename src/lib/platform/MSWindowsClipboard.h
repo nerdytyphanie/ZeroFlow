@@ -55,6 +55,7 @@ public:
   std::string get(Format) const override;
 
   void setFacade(IMSWindowsClipboardFacade &facade);
+  void captureUserFiles();
 
 private:
   void clearConverters();
@@ -75,6 +76,8 @@ private:
   static UINT s_ownershipFormat;
   IMSWindowsClipboardFacade *m_facade;
   bool m_deleteFacade;
+  HANDLE m_userFiles = nullptr;
+  DWORD m_userSequence = 0;
 };
 
 //! Clipboard format converter interface
