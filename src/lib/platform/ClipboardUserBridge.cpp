@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
+#include "arch/Arch.h"
+#include "arch/win32/ArchMiscWindows.h"
 #include "platform/ClipboardUserBridge.h"
 #include "platform/ClipboardImage.h"
 #include "base/Log.h"
@@ -298,6 +300,13 @@ int ClipboardUserBridge::dispatch(int argc, char **argv) {
     auto parsed = std::from_chars(value.data(), value.data() + value.size(), handles[i]);
     if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || !handles[i]) return 2;
   }
-  try { return helper(reinterpret_cast<HANDLE>(handles[0]), reinterpret_cast<HANDLE>(handles[1])); }
+  try {
+    // This early-entry process bypasses main's normal runtime initialization.
+    // Bitmap conversion uses Log, whose outputters depend on Arch.
+    ArchMiscWindows::setInstanceWin32(GetModuleHandle(nullptr));
+    Arch arch; arch.init();
+    Log log; log.setFilter(LogLevel::Level::Warning);
+    return helper(reinterpret_cast<HANDLE>(handles[0]), reinterpret_cast<HANDLE>(handles[1]));
+  }
   catch (const std::exception &) { return 1; }
 }
