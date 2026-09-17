@@ -4,6 +4,7 @@
  */
 #include "platform/FileClipboardTransfer.h"
 #include "platform/ClipboardUserBridge.h"
+#include "platform/ClipboardImage.h"
 #include "base/HeadlessStatus.h"
 #include "platform/MSWindowsClipboardFilesConverter.h"
 #include <shellapi.h>
@@ -57,7 +58,9 @@ struct Progress {
   quint64 total = 0, done = 0;
   int retries = 0;
   Clock::time_point started = Clock::now(), last = {};
+  bool image = false;
   void report(const char *state, const QString &file = {}) {
+    if (image) return;
     auto now = Clock::now();
     if (QStringView(u"transferring") == QLatin1StringView(state) && now - last < std::chrono::milliseconds(250)) return;
     last = now;
@@ -166,6 +169,8 @@ struct Snapshot {
   DWORD sequence = 0;
   HWND window = nullptr;
   bool pasted = false;
+  bool image = false;
+  Staging imageStaging;
   QByteArray token;
   std::vector<fs::path> roots;
   std::vector<fs::path> files;
@@ -203,9 +208,16 @@ void clearSourceClipboard(const Snapshot &snapshot, const std::function<bool()> 
 }
 void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled, Limits limits)
 {
+  snapshot.progress.image = snapshot.image;
   if (!snapshot.manifest.isEmpty()) return;
   snapshot.files.clear(); snapshot.sizes.clear();
   ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
+  if (snapshot.image && snapshot.roots.empty()) {
+    check(!cancelled(), "image transfer cancelled");
+    snapshot.roots.push_back(ClipboardUserBridge::required() ? ClipboardUserBridge::captureImage(snapshot.sequence)
+        : ClipboardImage::capture(snapshot.window, snapshot.sequence));
+    snapshot.imageStaging.directory = snapshot.roots.front().parent_path();
+  }
   std::vector<std::pair<fs::path, std::wstring>> pending;
   for (auto it = snapshot.roots.rbegin(); it != snapshot.roots.rend(); ++it)
     pending.push_back({*it, it->filename().wstring()});
@@ -235,6 +247,7 @@ void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled, Limits 
   }
   snapshot.identities.resize(snapshot.files.size());
   snapshot.progress = Progress{QString::fromLatin1(snapshot.token.toHex()), "send", total};
+  snapshot.progress.image = snapshot.image;
   snapshot.manifest = QJsonDocument(entries).toJson(QJsonDocument::Compact);
   check(!entries.empty() && snapshot.manifest.size() <= Converter::MaxMetadataBytes, "empty or oversized manifest");
 }
@@ -250,7 +263,7 @@ struct Service {
   std::atomic<bool> listening = false;
   std::atomic<quint64> generation = 0;
   std::jthread server;
-  struct Job { HWND window; std::string offer; quint64 generation; };
+  struct Job { HWND window; std::string offer; quint64 generation; bool image; };
   std::unique_ptr<Job> job;
   std::condition_variable work;
   std::jthread receiver;
@@ -324,6 +337,7 @@ void Service::serve(std::stop_token stop)
         check(snapshot != nullptr, "expired file clipboard offer");
         auto index = get32(request.last(4));
         if (resume && index == PastedIndex) {
+          check(!snapshot->image, "image clipboard does not use move-on-paste");
           if (!snapshot->pasted) {
             clearSourceClipboard(*snapshot, cancelled);
             snapshot->pasted = true;
@@ -341,6 +355,8 @@ void Service::serve(std::stop_token stop)
         if (resume && index == ReadyIndex) {
           snapshot->progress.done = snapshot->progress.total;
           snapshot->progress.report("ready");
+          // Retain the snapshot for other peers and idempotent acknowledgements.
+          // Image staging is removed when this offer is replaced or stopped.
           sendBytes(socket, QByteArray(wide ? 8 : 4, '\0'), cancelled, bytesSincePause);
           continue;
         }
@@ -533,12 +549,17 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
     auto cancelled = [&] { return stop.stop_requested() || generation != next->generation || GetClipboardOwner() != next->window; };
     try {
       ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
-      Drop staged{FileClipboardTransfer::receiveToTemp(next->offer, cancelled)};
+      Drop staged{FileClipboardTransfer::receiveToTemp(next->offer, cancelled, next->image)};
       check(staged.value != nullptr, "file transfer failed");
       Staging cleanup{dropPath(staged.value).parent_path()};
       std::vector<fs::path> paths;
       auto count = DragQueryFileW(static_cast<HDROP>(staged.value), 0xffffffff, nullptr, 0);
       for (UINT i = 0; i < count; ++i) paths.push_back(dropPath(staged.value, i));
+      Drop image;
+      if (next->image) {
+        check(paths.size() == 1 && paths.front().extension() == L".dib", "invalid clipboard image selection");
+        image.value = ClipboardImage::load(paths.front());
+      }
       bool opened = false;
       for (int attempt = 0; attempt < 50 && !cancelled(); ++attempt) {
         if (OpenClipboard(next->window)) { opened = true; break; }
@@ -547,6 +568,13 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
       if (!opened) throw std::runtime_error("clipboard is busy");
       bool published = false;
       if (!cancelled() && EmptyClipboard()) {
+        if (next->image) {
+          if (SetClipboardData(CF_DIB, image.value)) {
+            image.value = nullptr; published = true;
+            auto marker = GlobalAlloc(GMEM_MOVEABLE, 1);
+            if (marker && !SetClipboardData(RegisterClipboardFormatW(L"Deskflow Ownership"), marker)) GlobalFree(marker);
+          }
+        } else {
         auto effect = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
         auto value = effect ? static_cast<DWORD *>(GlobalLock(effect)) : nullptr;
         if (value) {
@@ -561,19 +589,20 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
             }
           } else GlobalFree(effect);
         } else if (effect) GlobalFree(effect);
+        }
       }
       CloseClipboard();
       check(published, "clipboard publication cancelled or failed");
       auto descriptor = QJsonDocument::fromJson(QByteArray::fromStdString(next->offer.substr(4))).object();
       publishedOffer = descriptor;
-      HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"state", "ready"}});
+      if (!next->image) HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"state", "ready"}});
       if (descriptor["resume"].toBool()) {
         try { fetch(descriptor, ReadyIndex, 0, [&] { return stop.stop_requested(); }); }
         catch (const std::exception &) { /* Ready locally even if acknowledgement cannot be delivered. */ }
       }
     } catch (const std::exception &) {
       auto descriptor = QJsonDocument::fromJson(QByteArray::fromStdString(next->offer.substr(4))).object();
-      HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"state", cancelled() ? "cancelled" : "failed"}});
+      if (!next->image) HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"state", cancelled() ? "cancelled" : "failed"}});
       OutputDebugStringW(L"ZeroFlow file clipboard transfer failed; input connection is unaffected.\n"); }
   }
 }) {}
@@ -592,6 +621,7 @@ void FileClipboardTransfer::stop()
 {
   auto &s = service(); s.generation++; s.receiver.request_stop(); s.work.notify_all(); s.server.request_stop();
   if (s.receiver.joinable()) s.receiver.join(); if (s.server.joinable()) s.server.join();
+  s.current.reset();
   ClipboardUserBridge::stop();
 }
 void FileClipboardTransfer::cancelReceive() { service().generation++; }
@@ -611,26 +641,46 @@ std::string FileClipboardTransfer::offer(HANDLE drop, HWND window)
   if (hosts.empty()) hosts.append("127.0.0.1");
   QJsonObject result;
   { std::lock_guard lock(s.mutex);
-    if (s.current && s.current->sequence == snapshot->sequence && s.current->roots == snapshot->roots) snapshot = s.current;
+    if (s.current && !s.current->image && s.current->sequence == snapshot->sequence && s.current->roots == snapshot->roots) snapshot = s.current;
     else s.current = snapshot;
     result = {{"token", QString::fromLatin1(snapshot->token.toHex())}, {"sha256", QString::fromLatin1(s.fingerprint)}, {"hosts", hosts}, {"resume", true}, {"version", 3}, {"policy", configured.load()},
               {"maximum", qint64(selectionLimit.load())}, {"files", qint64(fileLimit.load())}}; }
   return "ZFR1" + QJsonDocument(result).toJson(QJsonDocument::Compact).toStdString();
 }
-void FileClipboardTransfer::receiveAsync(HWND window, const std::string &offer)
+std::string FileClipboardTransfer::offerImage(HWND window, DWORD sequence)
+{
+  auto &s = service(); if (!s.listening || !sequence) return {};
+  auto snapshot = std::make_shared<Snapshot>(); snapshot->token.resize(32);
+  if (RAND_bytes(reinterpret_cast<unsigned char *>(snapshot->token.data()), 32) != 1) return {};
+  snapshot->sequence = sequence; snapshot->window = window; snapshot->image = true;
+  QJsonArray hosts;
+  for (const auto &address : QNetworkInterface::allAddresses())
+    if (local(address) && !address.isLoopback() && hosts.size() < 16) hosts.append(address.toString());
+  if (hosts.empty()) hosts.append("127.0.0.1");
+  QJsonObject result;
+  { std::lock_guard lock(s.mutex);
+    if (s.current && s.current->image && s.current->sequence == sequence) snapshot = s.current;
+    else s.current = snapshot;
+    result = {{"token", QString::fromLatin1(snapshot->token.toHex())}, {"sha256", QString::fromLatin1(s.fingerprint)}, {"hosts", hosts},
+              {"resume", true}, {"version", 3}, {"policy", configured.load()},
+              {"maximum", qint64(selectionLimit.load())}, {"files", qint64(fileLimit.load())}}; }
+  return "ZFR1" + QJsonDocument(result).toJson(QJsonDocument::Compact).toStdString();
+}
+void FileClipboardTransfer::receiveAsync(HWND window, const std::string &offer, bool image)
 {
   if (!offer.starts_with("ZFR1") || offer.size() > 8192) return;
   auto &s = service();
-  { std::lock_guard lock(s.mutex); s.job = std::make_unique<Service::Job>(Service::Job{window, offer, ++s.generation}); }
+  { std::lock_guard lock(s.mutex); s.job = std::make_unique<Service::Job>(Service::Job{window, offer, ++s.generation, image}); }
   s.work.notify_one();
 }
-HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const std::function<bool()> &cancelled)
+HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const std::function<bool()> &cancelled, bool image)
 {
   check(descriptor.starts_with("ZFR1") && descriptor.size() <= 8192, "invalid file offer");
   ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
   auto offer = QJsonDocument::fromJson(QByteArray::fromStdString(descriptor.substr(4))).object();
   const auto limits = receiveLimits(offer);
   Progress progress{offer["token"].toString(), "receive"};
+  progress.image = image;
   progress.report("preparing");
   try {
   auto manifest = QJsonDocument::fromJson(fetch(offer, UINT32_MAX, Converter::MaxMetadataBytes, cancelled, {}, UINT32_MAX, &progress));

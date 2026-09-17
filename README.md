@@ -14,7 +14,8 @@ The portable Windows x64 runtime is one executable, approximately 15 MB. It does
 
 - Headless server and client modes in the same executable.
 - Keyboard and mouse sharing between screens.
-- Text and image clipboard sharing over the main connection, limited to 3 MiB by default. Oversized clipboard transfers are discarded without disconnecting input.
+- Plain text clipboard sharing over the main connection, limited to 3 MiB by default. Copied image pixels use the separate TLS file connection and restore as pasteable images, silently and without delaying screen crossings. Both ends need ZeroFlow 1.4 or later for this image path; ordinary Deskflow peers retain keyboard, mouse, and text compatibility.
+- Image files copied in Explorer remain ordinary file transfers, with transfer progress and file paste behavior. Only copied image pixels use silent image restoration.
 - File and folder clipboard sharing with defaults of **384 MiB per selection and 128 regular files**, including nested and empty folders. Supervisors can raise either limit; 0 removes that user cap. File sizes and resume offsets use 64-bit values.
 - TLS connections, with automatic acceptance and storage of peer fingerprints.
 - Local-network ZeroFlow discovery and automatic placement of newly connected screens in the server layout.

@@ -38,6 +38,8 @@ if(WIN32)
     FileClipboardTransfer.h
     ClipboardUserBridge.cpp
     ClipboardUserBridge.h
+    ClipboardImage.cpp
+    ClipboardImage.h
     MSWindowsClipboardHTMLConverter.cpp
     MSWindowsClipboardHTMLConverter.h
     MSWindowsClipboardUTF16Converter.cpp

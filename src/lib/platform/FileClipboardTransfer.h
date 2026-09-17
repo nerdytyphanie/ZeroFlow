@@ -12,7 +12,8 @@ void start();
 void stop();
 void cancelReceive();
 std::string offer(HANDLE fileDrop, HWND window = nullptr);
-void receiveAsync(HWND window, const std::string &offer);
+std::string offerImage(HWND window, DWORD sequence);
+void receiveAsync(HWND window, const std::string &offer, bool image = false);
 // Also used by the integration test; does not touch the system clipboard.
-HANDLE receiveToTemp(const std::string &offer, const std::function<bool()> &cancelled);
+HANDLE receiveToTemp(const std::string &offer, const std::function<bool()> &cancelled, bool image = false);
 }

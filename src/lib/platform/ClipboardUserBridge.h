@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
 #pragma once
 #include <Windows.h>
+#include <filesystem>
 
 // Explorer's file clipboard can be hidden from a SYSTEM process even while
 // impersonating its user. Read it in a process with that user's primary token.
@@ -10,6 +11,8 @@ bool required();
 HANDLE readFiles(DWORD &sequence);
 // Clears only the last captured selection, if that sequence is still current.
 bool clearFiles(DWORD sequence);
+// Saves a matching image in the user's temp folder without sending pixels on IPC.
+std::filesystem::path captureImage(DWORD sequence);
 int dispatch(int argc, char **argv);
 void stop();
 }

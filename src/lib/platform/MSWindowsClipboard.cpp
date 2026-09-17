@@ -51,7 +51,9 @@ MSWindowsClipboard::~MSWindowsClipboard()
 
 void MSWindowsClipboard::captureUserFiles()
 {
-  if (m_userFiles) GlobalFree(m_userFiles);
+  if (m_userFiles) { GlobalFree(m_userFiles); m_userFiles = nullptr; }
+  // Prefer an actual file selection even if its shell owner also supplies an
+  // image preview. Pixel export uses an independent helper on the file worker.
   m_userFiles = ClipboardUserBridge::readFiles(m_userSequence);
 }
 
@@ -97,13 +99,15 @@ bool MSWindowsClipboard::empty()
 
 void MSWindowsClipboard::add(Format format, const std::string &data)
 {
+  // Keep old peers' plain text, but never publish inline HTML/image payloads.
+  if (format == Format::Bitmap || format == Format::HTML) return;
   // exit early if there is no data to prevent spurious "failed to convert clipboard data" errors
   if (data.empty()) {
     LOG_DEBUG("not adding 0 bytes to clipboard format: %d", format);
     return;
   }
-  if (format == Format::Files) {
-    FileClipboardTransfer::receiveAsync(m_window, data);
+  if (format == Format::Files || format == Format::ImageFile) {
+    FileClipboardTransfer::receiveAsync(m_window, data, format == Format::ImageFile);
     return;
   }
   bool isSucceeded = false;
@@ -171,11 +175,14 @@ IClipboard::Time MSWindowsClipboard::getTime() const
 
 bool MSWindowsClipboard::has(Format format) const
 {
+  if (format == Format::Bitmap || format == Format::HTML) return false;
   if (m_userFiles && GetClipboardSequenceNumber() == m_userSequence)
     return format == Format::Files;
   // File selections have one bounded payload, not additional shell text/image formats.
   if (IsClipboardFormatAvailable(CF_HDROP) && format != Format::Files)
     return false;
+  if (!IsClipboardFormatAvailable(CF_HDROP) && IsClipboardFormatAvailable(CF_DIB))
+    if (format != Format::Text) return format == Format::ImageFile;
   for (ConverterList::const_iterator index = m_converters.begin(); index != m_converters.end(); ++index) {
     IMSWindowsClipboardConverter *converter = *index;
     if (converter->getFormat() == format) {
@@ -189,6 +196,9 @@ bool MSWindowsClipboard::has(Format format) const
 
 std::string MSWindowsClipboard::get(Format format) const
 {
+  if (format == Format::Bitmap || format == Format::HTML) return {};
+  if (format == Format::ImageFile)
+    return FileClipboardTransfer::offerImage(m_window, GetClipboardSequenceNumber());
   if (format == Format::Files && m_userFiles && GetClipboardSequenceNumber() == m_userSequence)
     return FileClipboardTransfer::offer(m_userFiles, m_window);
   // find the converter for the first clipboard format we can handle

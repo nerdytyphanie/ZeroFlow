@@ -52,6 +52,7 @@ public:
     HTML,        //!< HTML format, HTML fragment, UTF-8, newline is LF
     Bitmap,      //!< Bitmap format, BMP 24/32bpp, BI_RGB
     Files,       //!< ZeroFlow file contents; received temporary files request move-on-paste
+    ImageFile,   //!< ZeroFlow image offer; pixels travel only on the file connection
     TotalFormats //!< The number of clipboard formats supported
   };
 

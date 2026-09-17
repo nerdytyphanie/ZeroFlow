@@ -19,10 +19,10 @@ if(WIN32)
   # Release identity is independent of the inherited Deskflow protocol version.
   block()
     set(CMAKE_PROJECT_VERSION_MAJOR 1)
-    set(CMAKE_PROJECT_VERSION_MINOR 3)
-    set(CMAKE_PROJECT_VERSION_PATCH 4)
+    set(CMAKE_PROJECT_VERSION_MINOR 4)
+    set(CMAKE_PROJECT_VERSION_PATCH 0)
     set(CMAKE_PROJECT_VERSION_TWEAK 0)
-    set(CMAKE_PROJECT_VERSION "1.3.4.0")
+    set(CMAKE_PROJECT_VERSION "1.4.0.0")
     configure_file(${CMAKE_SOURCE_DIR}/src/apps/res/windows.rc.in ${target}.rc)
   endblock()
 

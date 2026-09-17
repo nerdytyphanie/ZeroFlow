@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
 #include "platform/ClipboardUserBridge.h"
+#include "platform/ClipboardImage.h"
 #include "base/Log.h"
 #include <shellapi.h>
 #include <shlobj.h>
@@ -181,6 +182,7 @@ private:
   std::wstring helperDirectory, helperExecutable;
 };
 Bridge &bridge() { static Bridge value; return value; }
+Bridge &imageBridge() { static Bridge value; return value; }
 
 int helper(HANDLE input, HANDLE output) {
   check(GetFileType(input) == FILE_TYPE_PIPE && GetFileType(output) == FILE_TYPE_PIPE, "invalid clipboard helper pipes");
@@ -203,6 +205,10 @@ int helper(HANDLE input, HANDLE output) {
     readAll(input, request.data(), sizeof(request), GetTickCount64() + 1500);
     QJsonObject result{{"ok", false}};
     try {
+      if (request[0] == 3) {
+        auto image = ClipboardImage::capture(window, request[1]);
+        result = {{"ok", true}, {"path", QString::fromStdWString(image.wstring())}};
+      } else {
       ClipboardLock lock(window); check(lock.opened, "desktop clipboard is busy");
       if (request[0] == 1) {
         QJsonArray files;
@@ -225,6 +231,7 @@ int helper(HANDLE input, HANDLE output) {
           capturedSequence = 0; capturedPaths.clear();
         }
         result = {{"ok", true}};
+      }
       }
     } catch (const std::exception &) { }
     auto bytes = QJsonDocument(result).toJson(QJsonDocument::Compact);
@@ -276,7 +283,12 @@ bool ClipboardUserBridge::clearFiles(DWORD sequence) {
   try { bridge().request(2, sequence); return true; }
   catch (const std::exception &error) { LOG_WARN("file clipboard helper: %s", error.what()); return false; }
 }
-void ClipboardUserBridge::stop() { if (required()) bridge().stop(); }
+std::filesystem::path ClipboardUserBridge::captureImage(DWORD sequence) {
+  auto result = imageBridge().request(3, sequence);
+  check(result["path"].isString() && !result["path"].toString().isEmpty(), "clipboard helper image unavailable");
+  return std::filesystem::path(result["path"].toString().toStdWString());
+}
+void ClipboardUserBridge::stop() { if (required()) { bridge().stop(); imageBridge().stop(); } }
 int ClipboardUserBridge::dispatch(int argc, char **argv) {
   if (argc < 2 || std::string(argv[1]) != "--clipboard-user-helper") return -1;
   if (argc != 4 || required()) return 2;
