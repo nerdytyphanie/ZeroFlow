@@ -8,4 +8,5 @@ void update(const QString &command, const QString &value);
 void heartbeat();
 void layout(const QJsonObject &value);
 void transfer(const QJsonObject &progress);
+QJsonObject captureProgress(const QString &id);
 }

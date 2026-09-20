@@ -242,5 +242,6 @@ enum class EventTypes : uint32_t
 
   /// Stop libei
   EISessionClosed,
+  CaptureControl,
 };
 } // namespace deskflow

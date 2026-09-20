@@ -13,6 +13,8 @@
 #include "deskflow/DeskflowException.h"
 #include "deskflow/ProtocolUtil.h"
 #include "io/IStream.h"
+#include "platform/FileClipboardTransfer.h"
+#include <QJsonDocument>
 
 #include <cstring>
 
@@ -165,6 +167,22 @@ bool ClientProxy1_0::parseHandshakeMessage(const uint8_t *code)
 
 bool ClientProxy1_0::parseMessage(const uint8_t *code)
 {
+  if (memcmp(code, "ZCAP", 4) == 0) {
+    std::string json;
+    ProtocolUtil::readf(getStream(), "%s", &json);
+    if (json.size() > 16384) return false;
+    auto command = QJsonDocument::fromJson(QByteArray::fromStdString(json)).object();
+    command.remove("remote");
+    const auto action = command["command"].toString();
+    QJsonObject result;
+    if (action == "capture-receive" || action == "capture-status" || action == "capture-limits")
+      result = FileClipboardTransfer::captureCommand(command);
+    else result = {{"ok", false}, {"error", "unsupported capture operation"}};
+    result["request"] = command["request"];
+    auto response = QJsonDocument(result).toJson(QJsonDocument::Compact).toStdString();
+    ProtocolUtil::writef(getStream(), "ZCAR%s", &response);
+    return true;
+  }
   if (memcmp(code, kMsgDInfo, 4) == 0) {
     if (recvInfo()) {
       m_events->addEvent(Event(EventTypes::ScreenShapeChanged, getEventTarget()));

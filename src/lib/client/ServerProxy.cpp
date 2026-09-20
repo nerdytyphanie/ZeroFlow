@@ -20,6 +20,8 @@
 #include "deskflow/StreamChunker.h"
 #include "deskflow/ipc/CoreIpc.h"
 #include "io/IStream.h"
+#include "platform/FileClipboardTransfer.h"
+#include <QJsonDocument>
 
 #include <cstring>
 
@@ -207,6 +209,12 @@ ServerProxy::ConnectionResult ServerProxy::parseHandshakeMessage(const uint8_t *
 
 ServerProxy::ConnectionResult ServerProxy::parseMessage(const uint8_t *code)
 {
+  if (memcmp(code, "ZCAR", 4) == 0) {
+    std::string json;
+    ProtocolUtil::readf(m_stream, "%s", &json);
+    if (json.size() <= 16384) FileClipboardTransfer::captureResponse(QJsonDocument::fromJson(QByteArray::fromStdString(json)).object());
+    return ConnectionResult::Okay;
+  }
   using enum ConnectionResult;
 
   if (memcmp(code, kMsgDMouseMove, 4) == 0) {
@@ -379,6 +387,9 @@ void ServerProxy::onClipboardChanged(ClipboardID id, const IClipboard *clipboard
 
   StreamChunker::sendClipboard(data, data.size(), id, m_seqNum, m_events, this);
 }
+
+void ServerProxy::sendCaptureControl(const std::string &json)
+{ ProtocolUtil::writef(m_stream, "ZCAP%s", &json); }
 
 void ServerProxy::flushCompressedMouse()
 {

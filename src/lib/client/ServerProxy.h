@@ -49,6 +49,7 @@ public:
   void onInfoChanged();
   bool onGrabClipboard(ClipboardID);
   void onClipboardChanged(ClipboardID, const IClipboard *);
+  void sendCaptureControl(const std::string &json);
 
   //@}
 

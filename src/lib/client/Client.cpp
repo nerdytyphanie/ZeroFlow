@@ -27,6 +27,8 @@
 #include "net/ISocketFactory.h"
 #include "net/SecureSocket.h"
 #include "net/TCPSocket.h"
+#include "platform/FileClipboardTransfer.h"
+#include <QJsonDocument>
 
 #include <QMetaEnum>
 
@@ -36,6 +38,12 @@
 //
 // Client
 //
+namespace {
+struct CaptureControlEvent : EventData {
+  QJsonObject command;
+  explicit CaptureControlEvent(const QJsonObject &value) : command(value) {}
+};
+}
 
 Client::DisconnectRequest::DisconnectRequest(Kind kind, const char *message)
     : m_kind(kind),
@@ -70,10 +78,17 @@ Client::Client(
   // register suspend/resume event handlers
   m_events->addHandler(EventTypes::ScreenSuspend, getEventTarget(), [this](const auto &) { handleSuspend(); });
   m_events->addHandler(EventTypes::ScreenResume, getEventTarget(), [this](const auto &) { handleResume(); });
+  m_events->addHandler(EventTypes::CaptureControl, getEventTarget(), [this](const auto &event) {
+    auto data = static_cast<CaptureControlEvent *>(event.getDataObject());
+    if (m_server) m_server->sendCaptureControl(QJsonDocument(data->command).toJson(QJsonDocument::Compact).toStdString());
+    else FileClipboardTransfer::captureResponse({{"request", data->command["request"]}, {"ok", false}, {"error", "sharing server disconnected"}});
+  });
 }
 
 Client::~Client()
 {
+  FileClipboardTransfer::setCaptureSender({});
+  m_events->removeHandler(EventTypes::CaptureControl, getEventTarget());
   m_events->removeHandler(EventTypes::ScreenSuspend, getEventTarget());
   m_events->removeHandler(EventTypes::ScreenResume, getEventTarget());
 
@@ -316,6 +331,7 @@ void Client::screensaver(bool activate)
 
 void Client::resetOptions()
 {
+  FileClipboardTransfer::setCaptureSender({});
   m_relativeMouseMoves = false;
   m_hasRelativeRestorePosition = false;
   m_screen->resetOptions();
@@ -330,7 +346,13 @@ void Client::setOptions(const OptionsList &options)
 
   for (auto index = options.begin(); index != options.end(); ++index) {
     const OptionID id = *index;
-    if (id == kOptionClipboardSharing) {
+    if (id == kOptionCaptureTransfer) {
+      ++index;
+      if (index == options.end()) break;
+      if (*index == 1) FileClipboardTransfer::setCaptureSender([this](const QJsonObject &command) {
+        m_events->addEvent(Event(EventTypes::CaptureControl, getEventTarget(), new CaptureControlEvent(command)));
+      });
+    } else if (id == kOptionClipboardSharing) {
       index++;
       if (index != options.end()) {
         if (!*index) {
@@ -520,6 +542,7 @@ void Client::cleanupConnection()
 
 void Client::cleanupScreen()
 {
+  FileClipboardTransfer::setCaptureSender({});
   if (m_server != nullptr) {
     if (m_ready) {
       m_screen->releaseMouseButtons();

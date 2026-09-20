@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <QMap>
 
 namespace {
 // Process-lifetime writer. A stalled stdout reader can hold one write and one
@@ -18,6 +19,7 @@ struct Status {
   QString role, state = "starting";
   QByteArray pending, pendingTransfer;
   QJsonObject sending, receiving, layout;
+  QMap<QString, QJsonObject> captures;
   bool enabled = false;
   int peers = 0;
   QStringList connected;
@@ -78,8 +80,21 @@ void HeadlessStatus::transfer(const QJsonObject &progress)
   auto &s = status();
   std::scoped_lock lock(s.mutex);
   auto &saved = progress["direction"] == "send" ? s.sending : s.receiving;
-  if (saved["id"] != progress["id"]) saved = {};
+  if (saved["id"] != progress["id"]) saved = progress["capture"].toBool() ? s.captures.value(progress["id"].toString()) : QJsonObject{};
   for (auto it = progress.begin(); it != progress.end(); ++it) saved[it.key()] = it.value();
+  if (saved["capture"].toBool()) {
+    s.captures[saved["id"].toString()] = saved;
+    while (s.captures.size() > 32) {
+      auto old = s.captures.begin();
+      while (old != s.captures.end()) {
+        auto state = old.value()["state"].toString();
+        if (old.key() != saved["id"].toString() && (state == "saved" || state == "failed" || state == "cancelled")) break;
+        ++old;
+      }
+      if (old == s.captures.end()) break;
+      s.captures.erase(old);
+    }
+  }
   if (!s.enabled) return;
   auto record = saved;
   record["schema"] = 1; record["type"] = "transfer"; record["role"] = s.role;
@@ -89,3 +104,6 @@ void HeadlessStatus::transfer(const QJsonObject &progress)
 
 void HeadlessStatus::layout(const QJsonObject &value)
 { auto &s = status(); std::scoped_lock lock(s.mutex); s.layout = value; }
+
+QJsonObject HeadlessStatus::captureProgress(const QString &id)
+{ auto &s = status(); std::scoped_lock lock(s.mutex); return s.captures.value(id); }

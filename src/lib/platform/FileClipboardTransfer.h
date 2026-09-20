@@ -3,6 +3,7 @@
 #include "platform/MSWindowsClipboard.h"
 #include <functional>
 #include <QtGlobal>
+#include <QJsonObject>
 
 // File bytes never use the input connection. Only an ephemeral, TLS-pinned offer
 // is carried by its existing clipboard protocol.
@@ -11,6 +12,11 @@ void configure(quint64 speedMiB, quint64 selectionMiB, quint32 files = 128);
 void start();
 void stop();
 void cancelReceive();
+// Explicit captures use the same offer, TLS stream, limits and retry machinery.
+// The local service pipe sends through the existing negotiated sharing link.
+QJsonObject captureCommand(const QJsonObject &command);
+void setCaptureSender(std::function<void(const QJsonObject &)> send);
+void captureResponse(const QJsonObject &response);
 std::string offer(HANDLE fileDrop, HWND window = nullptr);
 std::string offerImage(HWND window, DWORD sequence);
 void receiveAsync(HWND window, const std::string &offer, bool image = false);

@@ -1140,6 +1140,10 @@ void Server::sendOptions(BaseClientProxy *client) const
     }
   }
 
+  // Unknown options are ignored by older peers. Do not send capture messages
+  // until the receiver has explicitly advertised this extension.
+  optionsList.push_back(kOptionCaptureTransfer);
+  optionsList.push_back(1);
   // send the options
   client->resetOptions();
   client->setOptions(optionsList);

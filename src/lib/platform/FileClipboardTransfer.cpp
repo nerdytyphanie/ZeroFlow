@@ -9,6 +9,7 @@
 #include "platform/MSWindowsClipboardFilesConverter.h"
 #include <shellapi.h>
 #include <shlobj.h>
+#include <sddl.h>
 #include <QCryptographicHash>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -29,6 +30,8 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <deque>
+#include <map>
 
 namespace {
 namespace fs = std::filesystem;
@@ -59,6 +62,7 @@ struct Progress {
   int retries = 0;
   Clock::time_point started = Clock::now(), last = {};
   bool image = false;
+  bool capture = false;
   void report(const char *state, const QString &file = {}) {
     if (image) return;
     auto now = Clock::now();
@@ -67,7 +71,7 @@ struct Progress {
     double seconds = std::chrono::duration<double>(now - started).count();
     HeadlessStatus::transfer({{"id", id}, {"direction", direction}, {"state", state},
       {"bytes", qint64(done)}, {"total", qint64(total)}, {"bytesPerSecond", seconds > 0 ? done / seconds : 0},
-      {"retries", retries}, {"file", file.left(160)}});
+      {"retries", retries}, {"file", file.left(160)}, {"capture", capture}});
   }
 };
 struct RateLimit {
@@ -161,6 +165,61 @@ fs::path dropPath(HANDLE drop, UINT index = 0)
   check(DragQueryFileW(static_cast<HDROP>(drop), index, path, 32768) != 0, "missing clipboard path");
   return fs::path(path);
 }
+fs::path knownFolder(REFKNOWNFOLDERID id)
+{
+  HANDLE token = nullptr;
+  check(OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_IMPERSONATE, TRUE, &token) || GetLastError() == ERROR_NO_TOKEN,
+        "capture user identity unavailable");
+  PWSTR value = nullptr;
+  auto result = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, token, &value);
+  if (token) CloseHandle(token);
+  check(SUCCEEDED(result), "capture folder unavailable");
+  fs::path path(value); CoTaskMemFree(value); return path;
+}
+fs::path captureRelative(const QString &value)
+{
+  auto path = fs::path(value.toStdWString());
+  check(!path.empty() && !path.is_absolute() && !path.has_root_name() && !path.has_root_directory(), "capture path must be relative");
+  for (const auto &part : path) {
+    const auto text = QString::fromStdWString(part.wstring());
+    const auto base = text.section('.', 0, 0).toUpper();
+    check(!text.isEmpty() && text != "." && text != ".." && !text.endsWith('.') && !text.endsWith(' ') &&
+          !text.contains(':') && !text.contains(QChar(0)) && !text.contains('*') && !text.contains('?') &&
+          !text.contains('<') && !text.contains('>') && !text.contains('|') && !text.contains('"') &&
+          base != "CON" && base != "PRN" && base != "AUX" && base != "NUL" &&
+          !(base.size() == 4 && (base.startsWith("COM") || base.startsWith("LPT")) && base[3] >= '0' && base[3] <= '9'),
+          "unsafe capture path");
+  }
+  check(value.size() < 2048, "capture path too long");
+  return path;
+}
+void noLinks(const fs::path &path, const fs::path &root)
+{
+  for (auto current = path; !current.empty();) {
+    // Windows may redirect the trusted known-folder root (for example OneDrive).
+    // Reject links introduced beneath it, not the user's configured root itself.
+    if (_wcsicmp(current.lexically_normal().c_str(), root.lexically_normal().c_str()) == 0) break;
+    auto attributes = GetFileAttributesW(current.c_str());
+    check(attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_REPARSE_POINT), "capture path uses a link");
+    auto parent = current.parent_path(); if (parent == current) break; current = parent;
+  }
+}
+fs::path saveCapture(const fs::path &source, const fs::path &videos, const fs::path &relative)
+{
+  auto destination = videos / relative;
+  noLinks(destination.parent_path(), videos);
+  fs::create_directories(destination.parent_path());
+  noLinks(destination.parent_path(), videos);
+  // Never overwrite an existing capture, including a same-name capture from another device.
+  for (int index = 0; index < 10000; ++index) {
+    auto candidate = index == 0 ? destination : destination.parent_path() /
+      (destination.stem().wstring() + L" (" + std::to_wstring(index) + L")" + destination.extension().wstring());
+    if (MoveFileExW(source.c_str(), candidate.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) return candidate;
+    auto error = GetLastError();
+    check(error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS, "could not save capture in Videos");
+  }
+  throw std::runtime_error("too many same-name captures in Videos");
+}
 struct Staging {
   fs::path directory;
   ~Staging() { if (!directory.empty()) { std::error_code ignored; fs::remove_all(directory, ignored); } }
@@ -170,6 +229,7 @@ struct Snapshot {
   HWND window = nullptr;
   bool pasted = false;
   bool image = false;
+  bool capture = false;
   Staging imageStaging;
   QByteArray token;
   std::vector<fs::path> roots;
@@ -209,6 +269,7 @@ void clearSourceClipboard(const Snapshot &snapshot, const std::function<bool()> 
 void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled, Limits limits)
 {
   snapshot.progress.image = snapshot.image;
+  snapshot.progress.capture = snapshot.capture;
   if (!snapshot.manifest.isEmpty()) return;
   snapshot.files.clear(); snapshot.sizes.clear();
   ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
@@ -248,6 +309,7 @@ void prepare(Snapshot &snapshot, const std::function<bool()> &cancelled, Limits 
   snapshot.identities.resize(snapshot.files.size());
   snapshot.progress = Progress{QString::fromLatin1(snapshot.token.toHex()), "send", total};
   snapshot.progress.image = snapshot.image;
+  snapshot.progress.capture = snapshot.capture;
   snapshot.manifest = QJsonDocument(entries).toJson(QJsonDocument::Compact);
   check(!entries.empty() && snapshot.manifest.size() <= Converter::MaxMetadataBytes, "empty or oversized manifest");
 }
@@ -259,18 +321,85 @@ struct Service {
   std::mutex mutex;
   std::condition_variable ready;
   std::shared_ptr<Snapshot> current;
+  std::map<QByteArray, std::shared_ptr<Snapshot>> captures;
+  std::function<void(const QJsonObject &)> captureSender;
+  std::map<quint64, QJsonObject> captureReplies;
+  quint64 captureRequest = 0;
   QByteArray fingerprint;
   std::atomic<bool> listening = false;
   std::atomic<quint64> generation = 0;
   std::jthread server;
-  struct Job { HWND window; std::string offer; quint64 generation; bool image; };
+  struct Job { HWND window; std::string offer; quint64 generation; bool image; fs::path videos; };
   std::unique_ptr<Job> job;
+  std::deque<std::unique_ptr<Job>> captureJobs;
   std::condition_variable work;
   std::jthread receiver;
+  std::jthread control;
   Service();
   void serve(std::stop_token stop);
 };
 Service &service() { static Service value; return value; }
+QJsonObject requestCapture(QJsonObject command)
+{
+  auto &s = service();
+  std::unique_lock lock(s.mutex);
+  check(bool(s.captureSender), "the connected PC does not support capture transfer; enable sharing and update ZeroFlow on both devices");
+  const auto request = ++s.captureRequest;
+  command["request"] = qint64(request);
+  s.captureReplies[request] = {};
+  s.captureSender(command); // Enqueues on the existing sharing connection's event thread.
+  s.ready.wait_for(lock, std::chrono::seconds(4), [&] { return !s.captureSender || !s.captureReplies[request].isEmpty(); });
+  auto result = std::move(s.captureReplies[request]); s.captureReplies.erase(request);
+  check(!result.isEmpty(), "the receiving PC did not answer the capture request");
+  return result;
+}
+
+void captureControl(std::stop_token stop)
+{
+  // The existing SYSTEM worker owns the offer. WHService only supplies metadata;
+  // file bytes still travel through serve()/fetch(), never this local control pipe.
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)", SDDL_REVISION_1, &descriptor, nullptr)) return;
+  SECURITY_ATTRIBUTES security{sizeof security, descriptor, FALSE};
+  DiskFile pipe;
+  pipe.value = CreateNamedPipeW(LR"(\\.\pipe\ZeroFlow-Captures)", PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536, 65536, 0, &security);
+  LocalFree(descriptor);
+  if (pipe.value == INVALID_HANDLE_VALUE) return;
+  while (!stop.stop_requested()) {
+    if (!ConnectNamedPipe(pipe.value, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) { Sleep(20); continue; }
+    QByteArray request;
+    auto deadline = GetTickCount64() + 5000;
+    while (!stop.stop_requested() && GetTickCount64() < deadline && !request.contains('\n') && request.size() <= 32768) {
+      DWORD available = 0, read = 0; char bytes[4096];
+      if (!PeekNamedPipe(pipe.value, nullptr, 0, nullptr, &available, nullptr)) break;
+      if (!available) { Sleep(10); continue; }
+      if (!ReadFile(pipe.value, bytes, qMin<DWORD>(available, sizeof bytes), &read, nullptr) || !read) break;
+      request.append(bytes, int(read));
+    }
+    if (request.contains('\n') && request.size() <= 32768) {
+      auto command = QJsonDocument::fromJson(request.left(request.indexOf('\n'))).object();
+      QJsonObject response;
+      command["remote"] = true;
+      if (command["command"] == "capture-send" ||
+          command["command"] == "capture-status" || command["command"] == "capture-limits")
+        response = FileClipboardTransfer::captureCommand(command);
+      else response = {{"ok", false}, {"error", "unsupported capture command"}};
+      auto bytes = QJsonDocument(response).toJson(QJsonDocument::Compact) + '\n'; DWORD written = 0;
+      if (WriteFile(pipe.value, bytes.constData(), DWORD(bytes.size()), &written, nullptr) && written == DWORD(bytes.size())) {
+        // Reader acknowledges before disconnect so unread response bytes are not discarded.
+        deadline = GetTickCount64() + 5000;
+        while (!stop.stop_requested() && GetTickCount64() < deadline) {
+          char ack; DWORD read = 0;
+          if (ReadFile(pipe.value, &ack, 1, &read, nullptr) && read) break;
+          if (GetLastError() != ERROR_NO_DATA) break;
+          Sleep(10);
+        }
+      }
+    }
+    DisconnectNamedPipe(pipe.value);
+  }
+}
 
 void certificate(QSslCertificate &certificate, QSslKey &key)
 {
@@ -333,11 +462,14 @@ void Service::serve(std::stop_token stop)
           offset = get32(options.first(4)); peerSpeed = get32(options.mid(4, 4)); peerMaximum = get32(options.last(4));
           check(peerMaximum <= Converter::MaxSelectionBytes && peerSpeed <= 1024, "invalid transfer limits");
         }
-        { std::lock_guard lock(mutex); if (current && request.mid(4, 32) == current->token) snapshot = current; }
+        { std::lock_guard lock(mutex);
+          if (current && request.mid(4, 32) == current->token) snapshot = current;
+          else if (auto it = captures.find(request.mid(4, 32)); it != captures.end()) snapshot = it->second;
+        }
         check(snapshot != nullptr, "expired file clipboard offer");
         auto index = get32(request.last(4));
         if (resume && index == PastedIndex) {
-          check(!snapshot->image, "image clipboard does not use move-on-paste");
+          check(!snapshot->image && !snapshot->capture, "this transfer does not use move-on-paste");
           if (!snapshot->pasted) {
             clearSourceClipboard(*snapshot, cancelled);
             snapshot->pasted = true;
@@ -354,7 +486,7 @@ void Service::serve(std::stop_token stop)
         prepare(*snapshot, cancelled, limits);
         if (resume && index == ReadyIndex) {
           snapshot->progress.done = snapshot->progress.total;
-          snapshot->progress.report("ready");
+          snapshot->progress.report(snapshot->capture ? "saved" : "ready");
           // Retain the snapshot for other peers and idempotent acknowledgements.
           // Image staging is removed when this offer is replaced or stopped.
           sendBytes(socket, QByteArray(wide ? 8 : 4, '\0'), cancelled, bytesSincePause);
@@ -504,7 +636,10 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
   auto nextPasteCheck = Clock::now();
   while (!stop.stop_requested()) {
     std::unique_ptr<Job> next;
-    { std::unique_lock lock(mutex); work.wait_for(lock, std::chrono::milliseconds(100), [&] { return job != nullptr; }); next = std::move(job); }
+    { std::unique_lock lock(mutex); work.wait_for(lock, std::chrono::milliseconds(100), [&] { return job != nullptr || !captureJobs.empty(); });
+      if (!captureJobs.empty()) { next = std::move(captureJobs.front()); captureJobs.pop_front(); }
+      else next = std::move(job);
+    }
     if (!next) {
       if (publishedPaths.empty() || Clock::now() < nextPasteCheck) continue;
       nextPasteCheck = Clock::now() + std::chrono::milliseconds(500);
@@ -545,8 +680,10 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
       if (pasted) publishedPaths.clear();
       continue;
     }
-    publishedPaths.clear();
-    auto cancelled = [&] { return stop.stop_requested() || generation != next->generation || GetClipboardOwner() != next->window; };
+    const bool capture = !next->videos.empty();
+    if (!capture) publishedPaths.clear();
+    auto cancelled = [&] { return stop.stop_requested() || (!capture &&
+      (generation != next->generation || GetClipboardOwner() != next->window)); };
     try {
       ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
       Drop staged{FileClipboardTransfer::receiveToTemp(next->offer, cancelled, next->image)};
@@ -555,6 +692,19 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
       std::vector<fs::path> paths;
       auto count = DragQueryFileW(static_cast<HDROP>(staged.value), 0xffffffff, nullptr, 0);
       for (UINT i = 0; i < count; ++i) paths.push_back(dropPath(staged.value, i));
+      if (capture) {
+        auto descriptor = QJsonDocument::fromJson(QByteArray::fromStdString(next->offer.substr(4))).object();
+        check(paths.size() == 1 && fs::is_regular_file(paths.front()), "capture offer must contain one file");
+        auto relative = captureRelative(descriptor["relativePath"].toString());
+        check(paths.front().filename() == relative.filename(), "capture filename does not match destination");
+        ClipboardDesktopUser savingUser; check(savingUser.valid, "capture save identity unavailable");
+        auto saved = saveCapture(paths.front(), next->videos, relative);
+        HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"capture", true},
+          {"state", "saved"}, {"path", QString::fromStdWString(saved.wstring())}});
+        try { fetch(descriptor, ReadyIndex, 0, [&] { return stop.stop_requested(); }); }
+        catch (const std::exception &) { /* The saved capture remains available if the sender disconnects. */ }
+        continue;
+      }
       Drop image;
       if (next->image) {
         check(paths.size() == 1 && paths.front().extension() == L".dib", "invalid clipboard image selection");
@@ -600,9 +750,10 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
         try { fetch(descriptor, ReadyIndex, 0, [&] { return stop.stop_requested(); }); }
         catch (const std::exception &) { /* Ready locally even if acknowledgement cannot be delivered. */ }
       }
-    } catch (const std::exception &) {
+    } catch (const std::exception &error) {
       auto descriptor = QJsonDocument::fromJson(QByteArray::fromStdString(next->offer.substr(4))).object();
-      if (!next->image) HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"state", cancelled() ? "cancelled" : "failed"}});
+      if (!next->image) HeadlessStatus::transfer({{"id", descriptor["token"]}, {"direction", "receive"}, {"capture", capture},
+        {"state", cancelled() ? "cancelled" : "failed"}, {"error", QString::fromUtf8(error.what())}});
       OutputDebugStringW(L"ZeroFlow file clipboard transfer failed; input connection is unaffected.\n"); }
   }
 }) {}
@@ -616,13 +767,145 @@ void FileClipboardTransfer::configure(quint64 speedMiB, quint64 selectionMiB, qu
   fileLimit = files ? files : PastedIndex - 1;
   configured = true;
 }
-void FileClipboardTransfer::start() { (void)service(); }
+void FileClipboardTransfer::start()
+{
+  auto &s = service();
+  if (ClipboardUserBridge::required() && !s.control.joinable()) s.control = std::jthread(captureControl);
+}
 void FileClipboardTransfer::stop()
 {
   auto &s = service(); s.generation++; s.receiver.request_stop(); s.work.notify_all(); s.server.request_stop();
+  s.control.request_stop(); if (s.control.joinable()) s.control.join();
   if (s.receiver.joinable()) s.receiver.join(); if (s.server.joinable()) s.server.join();
   s.current.reset();
+  s.captures.clear(); s.captureJobs.clear();
   ClipboardUserBridge::stop();
+}
+QJsonObject FileClipboardTransfer::captureCommand(const QJsonObject &command)
+{
+  try {
+    const auto action = command["command"].toString();
+    if (command["remote"].toBool() && (action == "capture-status" || action == "capture-limits")) {
+      auto request = command; request.remove("remote");
+      auto result = requestCapture(request);
+      if (result["ok"].toBool() && action == "capture-limits") {
+        const auto peer = result["maximumBytes"].toInteger();
+        const auto own = selectionLimit.load() == UnlimitedBytes ? 0 : qint64(selectionLimit.load());
+        result["maximumBytes"] = peer && own ? std::min(peer, own) : std::max(peer, own);
+        const auto peerSpeed = result["bytesPerSecond"].toInteger();
+        const auto ownSpeed = qint64(speedLimit.load() * ChunkBytes);
+        result["bytesPerSecond"] = peerSpeed && ownSpeed ? std::min(peerSpeed, ownSpeed) : std::max(peerSpeed, ownSpeed);
+        const auto peerFiles = result["maxFiles"].toInteger();
+        const auto ownFiles = qint64(fileLimit.load());
+        result["maxFiles"] = std::min(peerFiles, ownFiles);
+      } else if (result["ok"].toBool() && action == "capture-status") {
+        auto progress = result; progress.remove("request"); progress.remove("ok"); progress["direction"] = "send";
+        HeadlessStatus::transfer(progress);
+      }
+      return result;
+    }
+    if (action == "capture-send") {
+      // Capability is negotiated on the existing ZeroFlow connection before any
+      // metadata is sent, so old peers never interpret captures as clipboard data.
+      { auto &s = service(); std::lock_guard lock(s.mutex); check(bool(s.captureSender), "the PC is offline or its ZeroFlow needs updating"); }
+      auto source = command; source["command"] = "capture-offer"; source.remove("remote");
+      auto offer = captureCommand(source);
+      if (!offer["ok"].toBool()) return offer;
+      QJsonObject response;
+      try { response = requestCapture({{"command", "capture-receive"}, {"id", offer["id"]}, {"offer", offer["offer"]}}); }
+      catch (const std::exception &error) { response = {{"ok", false}, {"error", QString::fromUtf8(error.what())}}; }
+      if (!response["ok"].toBool()) {
+        HeadlessStatus::transfer({{"id", offer["id"]}, {"direction", "send"}, {"capture", true}, {"state", "failed"}, {"error", response["error"]}});
+        response["id"] = offer["id"]; return response;
+      }
+      offer.remove("offer"); // The service/overlay never needs the transfer secret.
+      return offer;
+    }
+    if (action == "capture-limits") return {{"ok", true}, {"maximumBytes", qint64(selectionLimit.load() == UnlimitedBytes ? 0 : selectionLimit.load())},
+      {"maxFiles", qint64(fileLimit.load())}, {"bytesPerSecond", qint64(speedLimit.load() * ChunkBytes)}};
+    if (action == "capture-status") {
+      auto progress = HeadlessStatus::captureProgress(command["id"].toString());
+      check(!progress.isEmpty(), "capture transfer is unknown or its runtime restarted");
+      progress["ok"] = true; return progress;
+    }
+    ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
+    auto &s = service();
+    if (action == "capture-offer") {
+      check(s.listening, "ZeroFlow file transfer is not ready");
+      const auto path = fs::path(command["path"].toString().toStdWString());
+      const auto relative = captureRelative(command["relativePath"].toString());
+      check(path.is_absolute(), "capture source must be absolute");
+      const auto videos = knownFolder(FOLDERID_Videos);
+      const auto screenshots = knownFolder(FOLDERID_Pictures) / L"Screenshots";
+      auto same = [](const fs::path &a, const fs::path &b) {
+        return _wcsicmp(a.lexically_normal().c_str(), b.lexically_normal().c_str()) == 0;
+      };
+      const bool screenshot = relative.begin()->wstring() == L"Screenshots" &&
+        same(path, screenshots.parent_path() / relative);
+      const bool video = same(path, videos / relative);
+      check(video || screenshot, "capture source does not match its Videos-relative location");
+      noLinks(path, video ? videos : screenshots);
+      check(fs::is_regular_file(path), "capture source is unavailable");
+      auto snapshot = std::make_shared<Snapshot>(); snapshot->capture = true;
+      snapshot->roots.push_back(path); snapshot->token.resize(32);
+      check(RAND_bytes(reinterpret_cast<unsigned char *>(snapshot->token.data()), 32) == 1, "capture identity failed");
+      const auto id = QString::fromLatin1(snapshot->token.toHex());
+      prepare(*snapshot, [] { return false; }, {selectionLimit.load(), fileLimit.load()});
+      QJsonArray hosts;
+      for (const auto &address : QNetworkInterface::allAddresses())
+        if (local(address) && !address.isLoopback() && hosts.size() < 16) hosts.append(address.toString());
+      check(!hosts.empty(), "no local-network address for capture transfer");
+      QJsonObject offer;
+      { std::lock_guard lock(s.mutex);
+        for (auto it = s.captures.begin(); it != s.captures.end();) {
+          auto state = HeadlessStatus::captureProgress(QString::fromLatin1(it->first.toHex()))["state"].toString();
+          if (state == "saved" || state == "failed" || state == "cancelled") it = s.captures.erase(it); else ++it;
+        }
+        check(s.captures.size() < 8, "too many pending capture transfers");
+        s.captures[snapshot->token] = snapshot;
+        offer = {{"token", id}, {"sha256", QString::fromLatin1(s.fingerprint)}, {"hosts", hosts}, {"resume", true},
+          {"version", 3}, {"policy", configured.load()}, {"maximum", qint64(selectionLimit.load())},
+          {"files", qint64(fileLimit.load())}, {"capture", true}, {"relativePath", command["relativePath"]}};
+      }
+      snapshot->progress.report("preparing", QString::fromStdWString(path.filename().wstring()));
+      return {{"ok", true}, {"id", id}, {"offer", QString::fromStdString("ZFR1" + QJsonDocument(offer).toJson(QJsonDocument::Compact).toStdString())},
+        {"relativePath", command["relativePath"]}, {"total", qint64(snapshot->progress.total)}, {"state", "preparing"}};
+    }
+    if (action == "capture-receive") {
+      const auto text = command["offer"].toString().toStdString();
+      check(text.starts_with("ZFR1") && text.size() <= 8192, "invalid capture offer");
+      auto offer = QJsonDocument::fromJson(QByteArray::fromStdString(text.substr(4))).object();
+      check(offer["capture"].toBool() && offer["version"].toInt() >= 3 && offer["token"] == command["id"], "invalid capture identity");
+      check(offer["token"].toString().size() == 64 && QByteArray::fromHex(offer["token"].toString().toLatin1()).size() == 32, "invalid capture token");
+      captureRelative(offer["relativePath"].toString());
+      auto videos = knownFolder(FOLDERID_Videos);
+      { std::lock_guard lock(s.mutex);
+        if (!HeadlessStatus::captureProgress(command["id"].toString()).isEmpty())
+          return {{"ok", true}, {"id", command["id"]}, {"state", "accepted"}};
+        check(s.captureJobs.size() < 8, "capture receive queue is full");
+        HeadlessStatus::transfer({{"id", command["id"]}, {"capture", true}, {"direction", "receive"}, {"state", "preparing"}});
+        s.captureJobs.push_back(std::make_unique<Service::Job>(Service::Job{nullptr, text, 0, false, videos}));
+      }
+      s.work.notify_one();
+      return {{"ok", true}, {"id", command["id"]}, {"state", "preparing"}};
+    }
+    throw std::runtime_error("unsupported capture command");
+  } catch (const std::exception &error) { return {{"ok", false}, {"error", QString::fromUtf8(error.what())}}; }
+}
+void FileClipboardTransfer::setCaptureSender(std::function<void(const QJsonObject &)> send)
+{
+  auto &s = service();
+  { std::lock_guard lock(s.mutex); s.captureSender = std::move(send); }
+  s.ready.notify_all();
+}
+void FileClipboardTransfer::captureResponse(const QJsonObject &response)
+{
+  auto &s = service();
+  { std::lock_guard lock(s.mutex);
+    auto it = s.captureReplies.find(quint64(response["request"].toInteger()));
+    if (it != s.captureReplies.end()) it->second = response;
+  }
+  s.ready.notify_all();
 }
 void FileClipboardTransfer::cancelReceive() { service().generation++; }
 std::string FileClipboardTransfer::offer(HANDLE drop, HWND window)
@@ -681,11 +964,13 @@ HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const
   const auto limits = receiveLimits(offer);
   Progress progress{offer["token"].toString(), "receive"};
   progress.image = image;
+  progress.capture = offer["capture"].toBool();
   progress.report("preparing");
   try {
   auto manifest = QJsonDocument::fromJson(fetch(offer, UINT32_MAX, Converter::MaxMetadataBytes, cancelled, {}, UINT32_MAX, &progress));
   check(manifest.isArray() && !manifest.array().empty(), "invalid file manifest");
   auto entries = manifest.array(); QByteArray skeleton("ZFC1"); put32(skeleton, static_cast<quint32>(entries.size()));
+  if (progress.capture) check(entries.size() == 1 && !entries[0].toObject()["directory"].toBool(), "capture offer must contain one file");
   std::vector<std::pair<QString, quint64>> files; quint64 total = 0;
   for (const auto &value : entries) {
     check(value.isObject(), "invalid file entry"); auto entry = value.toObject();
