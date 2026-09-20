@@ -47,7 +47,8 @@ std::atomic<quint64> selectionLimit = Converter::MaxSelectionBytes;
 std::atomic<quint32> fileLimit = Converter::MaxFiles;
 std::atomic<bool> configured = false;
 struct Limits { quint64 bytes; quint32 files; };
-Limits receiveLimits(const QJsonObject &offer) {
+Limits receiveLimits(const QJsonObject &offer, bool capture = false) {
+  if (capture) return {UnlimitedBytes, 1};
   if (!configured && offer["policy"].toBool()) {
     auto bytes = offer["maximum"].toInteger(-1), files = offer["files"].toInteger(-1);
     if (bytes >= 0 && files > 0 && files < PastedIndex) return {quint64(bytes), quint32(files)};
@@ -483,6 +484,7 @@ void Service::serve(std::stop_token stop)
         check(!snapshot->pasted, "completed file clipboard offer");
         Limits limits{configured ? std::min(selectionLimit.load(), peerMaximum) : peerMaximum,
                       configured ? std::min(fileLimit.load(), peerFiles) : peerFiles};
+        if (snapshot->capture) limits = {peerMaximum, 1};
         prepare(*snapshot, cancelled, limits);
         if (resume && index == ReadyIndex) {
           snapshot->progress.done = snapshot->progress.total;
@@ -563,7 +565,7 @@ QByteArray fetch(const QJsonObject &offer, quint32 index, quint64 maximum, const
   auto hosts = offer["hosts"].toArray(); check(!hosts.empty() && hosts.size() <= 16, "invalid file offer addresses");
   const bool wide = offer["version"].toInt() >= 3;
   const bool resume = wide || offer["resume"].toBool();
-  const auto limits = receiveLimits(offer);
+  const auto limits = receiveLimits(offer, progress && progress->capture);
   quint64 committed = 0;
   std::string failure = "file clipboard endpoint is unavailable";
   int preferred = -1;
@@ -686,7 +688,7 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
       (generation != next->generation || GetClipboardOwner() != next->window)); };
     try {
       ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
-      Drop staged{FileClipboardTransfer::receiveToTemp(next->offer, cancelled, next->image)};
+      Drop staged{FileClipboardTransfer::receiveToTemp(next->offer, cancelled, next->image, capture)};
       check(staged.value != nullptr, "file transfer failed");
       Staging cleanup{dropPath(staged.value).parent_path()};
       std::vector<fs::path> paths;
@@ -789,15 +791,13 @@ QJsonObject FileClipboardTransfer::captureCommand(const QJsonObject &command)
       auto request = command; request.remove("remote");
       auto result = requestCapture(request);
       if (result["ok"].toBool() && action == "capture-limits") {
-        const auto peer = result["maximumBytes"].toInteger();
-        const auto own = selectionLimit.load() == UnlimitedBytes ? 0 : qint64(selectionLimit.load());
-        result["maximumBytes"] = peer && own ? std::min(peer, own) : std::max(peer, own);
+        // Local clipboard limits do not cap captures. Preserve an older peer's
+        // reported capture cap until that peer has also been updated.
         const auto peerSpeed = result["bytesPerSecond"].toInteger();
         const auto ownSpeed = qint64(speedLimit.load() * ChunkBytes);
         result["bytesPerSecond"] = peerSpeed && ownSpeed ? std::min(peerSpeed, ownSpeed) : std::max(peerSpeed, ownSpeed);
         const auto peerFiles = result["maxFiles"].toInteger();
-        const auto ownFiles = qint64(fileLimit.load());
-        result["maxFiles"] = std::min(peerFiles, ownFiles);
+        result["maxFiles"] = std::min(peerFiles, qint64(1));
       } else if (result["ok"].toBool() && action == "capture-status") {
         auto progress = result; progress.remove("request"); progress.remove("ok"); progress["direction"] = "send";
         HeadlessStatus::transfer(progress);
@@ -821,8 +821,8 @@ QJsonObject FileClipboardTransfer::captureCommand(const QJsonObject &command)
       offer.remove("offer"); // The service/overlay never needs the transfer secret.
       return offer;
     }
-    if (action == "capture-limits") return {{"ok", true}, {"maximumBytes", qint64(selectionLimit.load() == UnlimitedBytes ? 0 : selectionLimit.load())},
-      {"maxFiles", qint64(fileLimit.load())}, {"bytesPerSecond", qint64(speedLimit.load() * ChunkBytes)}};
+    if (action == "capture-limits") return {{"ok", true}, {"maximumBytes", qint64(0)},
+      {"maxFiles", qint64(1)}, {"bytesPerSecond", qint64(speedLimit.load() * ChunkBytes)}};
     if (action == "capture-status") {
       auto progress = HeadlessStatus::captureProgress(command["id"].toString());
       check(!progress.isEmpty(), "capture transfer is unknown or its runtime restarted");
@@ -850,7 +850,7 @@ QJsonObject FileClipboardTransfer::captureCommand(const QJsonObject &command)
       snapshot->roots.push_back(path); snapshot->token.resize(32);
       check(RAND_bytes(reinterpret_cast<unsigned char *>(snapshot->token.data()), 32) == 1, "capture identity failed");
       const auto id = QString::fromLatin1(snapshot->token.toHex());
-      prepare(*snapshot, [] { return false; }, {selectionLimit.load(), fileLimit.load()});
+      prepare(*snapshot, [] { return false; }, {UnlimitedBytes, 1});
       QJsonArray hosts;
       for (const auto &address : QNetworkInterface::allAddresses())
         if (local(address) && !address.isLoopback() && hosts.size() < 16) hosts.append(address.toString());
@@ -864,8 +864,8 @@ QJsonObject FileClipboardTransfer::captureCommand(const QJsonObject &command)
         check(s.captures.size() < 8, "too many pending capture transfers");
         s.captures[snapshot->token] = snapshot;
         offer = {{"token", id}, {"sha256", QString::fromLatin1(s.fingerprint)}, {"hosts", hosts}, {"resume", true},
-          {"version", 3}, {"policy", configured.load()}, {"maximum", qint64(selectionLimit.load())},
-          {"files", qint64(fileLimit.load())}, {"capture", true}, {"relativePath", command["relativePath"]}};
+          {"version", 3}, {"policy", true}, {"maximum", qint64(UnlimitedBytes)},
+          {"files", qint64(1)}, {"capture", true}, {"relativePath", command["relativePath"]}};
       }
       snapshot->progress.report("preparing", QString::fromStdWString(path.filename().wstring()));
       return {{"ok", true}, {"id", id}, {"offer", QString::fromStdString("ZFR1" + QJsonDocument(offer).toJson(QJsonDocument::Compact).toStdString())},
@@ -956,15 +956,16 @@ void FileClipboardTransfer::receiveAsync(HWND window, const std::string &offer, 
   { std::lock_guard lock(s.mutex); s.job = std::make_unique<Service::Job>(Service::Job{window, offer, ++s.generation, image}); }
   s.work.notify_one();
 }
-HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const std::function<bool()> &cancelled, bool image)
+HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const std::function<bool()> &cancelled, bool image, bool capture)
 {
   check(descriptor.starts_with("ZFR1") && descriptor.size() <= 8192, "invalid file offer");
   ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
   auto offer = QJsonDocument::fromJson(QByteArray::fromStdString(descriptor.substr(4))).object();
-  const auto limits = receiveLimits(offer);
+  check(!offer["capture"].toBool() || capture, "capture offers require an explicit capture request");
+  const auto limits = receiveLimits(offer, capture);
   Progress progress{offer["token"].toString(), "receive"};
   progress.image = image;
-  progress.capture = offer["capture"].toBool();
+  progress.capture = capture;
   progress.report("preparing");
   try {
   auto manifest = QJsonDocument::fromJson(fetch(offer, UINT32_MAX, Converter::MaxMetadataBytes, cancelled, {}, UINT32_MAX, &progress));

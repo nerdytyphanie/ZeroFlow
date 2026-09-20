@@ -17,6 +17,7 @@ The portable Windows x64 runtime is one executable, approximately 15 MB. It does
 - Plain text clipboard sharing over the main connection, limited to 3 MiB by default. Copied image pixels use the separate TLS file connection and restore as pasteable images, silently and without delaying screen crossings. Both ends need ZeroFlow 1.4 or later for this image path; ordinary Deskflow peers retain keyboard, mouse, and text compatibility.
 - Image files copied in Explorer remain ordinary file transfers, with transfer progress and file paste behavior. Only copied image pixels use silent image restoration.
 - File and folder clipboard sharing with defaults of **384 MiB per selection and 128 regular files**, including nested and empty folders. Supervisors can raise either limit; 0 removes that user cap. File sizes and resume offsets use 64-bit values.
+- Explicit capture transfers save a single recording or screenshot into the receiving user's Videos folder, preserving its relative path. From 1.4.3, captures have no configured file-size cap; both peers must be updated. Clipboard size limits remain unchanged, and transfer speed limits still apply.
 - TLS connections, with automatic acceptance and storage of peer fingerprints.
 - Local-network ZeroFlow discovery and automatic placement of newly connected screens in the server layout.
 - Optional JSON status/heartbeat output and a stdin command for graceful shutdown.

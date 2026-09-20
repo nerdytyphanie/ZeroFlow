@@ -12,7 +12,8 @@ void configure(quint64 speedMiB, quint64 selectionMiB, quint32 files = 128);
 void start();
 void stop();
 void cancelReceive();
-// Explicit captures use the same offer, TLS stream, limits and retry machinery.
+// Explicit captures reuse the TLS stream and retry machinery without the file
+// clipboard's selection-size cap. Speed limits still apply.
 // The local service pipe sends through the existing negotiated sharing link.
 QJsonObject captureCommand(const QJsonObject &command);
 void setCaptureSender(std::function<void(const QJsonObject &)> send);
@@ -21,5 +22,5 @@ std::string offer(HANDLE fileDrop, HWND window = nullptr);
 std::string offerImage(HWND window, DWORD sequence);
 void receiveAsync(HWND window, const std::string &offer, bool image = false);
 // Also used by the integration test; does not touch the system clipboard.
-HANDLE receiveToTemp(const std::string &offer, const std::function<bool()> &cancelled, bool image = false);
+HANDLE receiveToTemp(const std::string &offer, const std::function<bool()> &cancelled, bool image = false, bool capture = false);
 }
