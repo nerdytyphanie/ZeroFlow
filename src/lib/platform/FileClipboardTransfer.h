@@ -8,7 +8,7 @@
 // File bytes never use the input connection. Only an ephemeral, TLS-pinned offer
 // is carried by its existing clipboard protocol.
 namespace FileClipboardTransfer {
-void configure(quint64 speedMiB, quint64 selectionMiB, quint32 files = 128);
+void configure(quint64 speedMiB, quint64 selectionMiB, quint32 files = 128, bool filesEnabled = true);
 void start();
 void stop();
 void cancelReceive();

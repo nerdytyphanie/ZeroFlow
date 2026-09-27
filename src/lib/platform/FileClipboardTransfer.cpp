@@ -46,9 +46,10 @@ std::atomic<quint64> speedLimit = 0;
 std::atomic<quint64> selectionLimit = Converter::MaxSelectionBytes;
 std::atomic<quint32> fileLimit = Converter::MaxFiles;
 std::atomic<bool> configured = false;
+std::atomic<bool> generalFilesEnabled = true;
 struct Limits { quint64 bytes; quint32 files; };
-Limits receiveLimits(const QJsonObject &offer, bool capture = false) {
-  if (capture) return {UnlimitedBytes, 1};
+Limits receiveLimits(const QJsonObject &offer, bool capture = false, bool image = false) {
+  if (capture || (image && !generalFilesEnabled.load())) return {UnlimitedBytes, 1};
   if (!configured && offer["policy"].toBool()) {
     auto bytes = offer["maximum"].toInteger(-1), files = offer["files"].toInteger(-1);
     if (bytes >= 0 && files > 0 && files < PastedIndex) return {quint64(bytes), quint32(files)};
@@ -443,8 +444,9 @@ void Service::serve(std::stop_token stop)
       socket.setReadBufferSize(ChunkBytes); socket.setLocalCertificate(cert); socket.setPrivateKey(key);
       socket.setPeerVerifyMode(QSslSocket::VerifyNone); socket.startServerEncryption();
       if (!socket.waitForEncrypted(5000)) continue;
-      auto cancelled = [&] { return stop.stop_requested(); };
       std::shared_ptr<Snapshot> snapshot;
+      auto cancelled = [&] { return stop.stop_requested() ||
+        (snapshot && !snapshot->image && !snapshot->capture && !generalFilesEnabled.load()); };
       try {
         ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
         auto request = readBytes(socket, 40, cancelled);
@@ -468,6 +470,7 @@ void Service::serve(std::stop_token stop)
           else if (auto it = captures.find(request.mid(4, 32)); it != captures.end()) snapshot = it->second;
         }
         check(snapshot != nullptr, "expired file clipboard offer");
+        check(generalFilesEnabled.load() || snapshot->image || snapshot->capture, "file transfer is disabled");
         auto index = get32(request.last(4));
         if (resume && index == PastedIndex) {
           check(!snapshot->image && !snapshot->capture, "this transfer does not use move-on-paste");
@@ -484,7 +487,7 @@ void Service::serve(std::stop_token stop)
         check(!snapshot->pasted, "completed file clipboard offer");
         Limits limits{configured ? std::min(selectionLimit.load(), peerMaximum) : peerMaximum,
                       configured ? std::min(fileLimit.load(), peerFiles) : peerFiles};
-        if (snapshot->capture) limits = {peerMaximum, 1};
+        if (snapshot->capture || (snapshot->image && !generalFilesEnabled.load())) limits = {peerMaximum, 1};
         prepare(*snapshot, cancelled, limits);
         if (resume && index == ReadyIndex) {
           snapshot->progress.done = snapshot->progress.total;
@@ -565,7 +568,7 @@ QByteArray fetch(const QJsonObject &offer, quint32 index, quint64 maximum, const
   auto hosts = offer["hosts"].toArray(); check(!hosts.empty() && hosts.size() <= 16, "invalid file offer addresses");
   const bool wide = offer["version"].toInt() >= 3;
   const bool resume = wide || offer["resume"].toBool();
-  const auto limits = receiveLimits(offer, progress && progress->capture);
+  const auto limits = receiveLimits(offer, progress && progress->capture, progress && progress->image);
   quint64 committed = 0;
   std::string failure = "file clipboard endpoint is unavailable";
   int preferred = -1;
@@ -761,12 +764,13 @@ Service::Service() : server([this](std::stop_token stop) { serve(stop); }), rece
 }) {}
 } // namespace
 
-void FileClipboardTransfer::configure(quint64 speedMiB, quint64 selectionMiB, quint32 files)
+void FileClipboardTransfer::configure(quint64 speedMiB, quint64 selectionMiB, quint32 files, bool filesEnabled)
 {
   check(selectionMiB <= UnlimitedBytes / ChunkBytes && speedMiB <= UnlimitedBytes / ChunkBytes && files < PastedIndex, "invalid transfer limits");
   speedLimit = speedMiB;
   selectionLimit = selectionMiB ? selectionMiB * ChunkBytes : UnlimitedBytes;
   fileLimit = files ? files : PastedIndex - 1;
+  generalFilesEnabled = filesEnabled;
   configured = true;
 }
 void FileClipboardTransfer::start()
@@ -910,6 +914,7 @@ void FileClipboardTransfer::captureResponse(const QJsonObject &response)
 void FileClipboardTransfer::cancelReceive() { service().generation++; }
 std::string FileClipboardTransfer::offer(HANDLE drop, HWND window)
 {
+  if (!generalFilesEnabled.load()) return {};
   auto &s = service(); if (!s.listening) return {};
   auto snapshot = std::make_shared<Snapshot>(); snapshot->token.resize(32);
   if (RAND_bytes(reinterpret_cast<unsigned char *>(snapshot->token.data()), 32) != 1) return {};
@@ -946,11 +951,13 @@ std::string FileClipboardTransfer::offerImage(HWND window, DWORD sequence)
     else s.current = snapshot;
     result = {{"token", QString::fromLatin1(snapshot->token.toHex())}, {"sha256", QString::fromLatin1(s.fingerprint)}, {"hosts", hosts},
               {"resume", true}, {"version", 3}, {"policy", configured.load()},
-              {"maximum", qint64(selectionLimit.load())}, {"files", qint64(fileLimit.load())}}; }
+              {"maximum", qint64(generalFilesEnabled.load() ? selectionLimit.load() : UnlimitedBytes)},
+              {"files", qint64(generalFilesEnabled.load() ? fileLimit.load() : 1)}}; }
   return "ZFR1" + QJsonDocument(result).toJson(QJsonDocument::Compact).toStdString();
 }
 void FileClipboardTransfer::receiveAsync(HWND window, const std::string &offer, bool image)
 {
+  if (!image && !generalFilesEnabled.load()) return;
   if (!offer.starts_with("ZFR1") || offer.size() > 8192) return;
   auto &s = service();
   { std::lock_guard lock(s.mutex); s.job = std::make_unique<Service::Job>(Service::Job{window, offer, ++s.generation, image}); }
@@ -958,17 +965,19 @@ void FileClipboardTransfer::receiveAsync(HWND window, const std::string &offer, 
 }
 HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const std::function<bool()> &cancelled, bool image, bool capture)
 {
+  check(generalFilesEnabled.load() || image || capture, "file transfer is disabled");
   check(descriptor.starts_with("ZFR1") && descriptor.size() <= 8192, "invalid file offer");
   ClipboardDesktopUser user; check(user.valid, "desktop identity unavailable");
   auto offer = QJsonDocument::fromJson(QByteArray::fromStdString(descriptor.substr(4))).object();
   check(!offer["capture"].toBool() || capture, "capture offers require an explicit capture request");
-  const auto limits = receiveLimits(offer, capture);
+  const auto limits = receiveLimits(offer, capture, image);
+  auto transferCancelled = [&] { return cancelled() || (!image && !capture && !generalFilesEnabled.load()); };
   Progress progress{offer["token"].toString(), "receive"};
   progress.image = image;
   progress.capture = capture;
   progress.report("preparing");
   try {
-  auto manifest = QJsonDocument::fromJson(fetch(offer, UINT32_MAX, Converter::MaxMetadataBytes, cancelled, {}, UINT32_MAX, &progress));
+  auto manifest = QJsonDocument::fromJson(fetch(offer, UINT32_MAX, Converter::MaxMetadataBytes, transferCancelled, {}, UINT32_MAX, &progress));
   check(manifest.isArray() && !manifest.array().empty(), "invalid file manifest");
   auto entries = manifest.array(); QByteArray skeleton("ZFC1"); put32(skeleton, static_cast<quint32>(entries.size()));
   if (progress.capture) check(entries.size() == 1 && !entries[0].toObject()["directory"].toBool(), "capture offer must contain one file");
@@ -992,7 +1001,7 @@ HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const
   check(staged.value != nullptr, "unsafe file paths or failed staging");
   Staging cleanup{dropPath(staged.value).parent_path()};
   for (quint32 i = 0; i < files.size(); ++i) {
-    check(!cancelled(), "file transfer cancelled");
+    check(!transferCancelled(), "file transfer cancelled");
     auto destination = cleanup.directory / files[i].first.toStdWString();
     DiskFile file;
     file.value = CreateFileW(destination.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -1000,17 +1009,17 @@ HANDLE FileClipboardTransfer::receiveToTemp(const std::string &descriptor, const
     BY_HANDLE_FILE_INFORMATION info{};
     check(GetFileInformationByHandle(file.value, &info) &&
           !(info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)), "staged file changed");
-    fetch(offer, i, limits.bytes, cancelled, [&](const QByteArray &bytes) {
+    fetch(offer, i, limits.bytes, transferCancelled, [&](const QByteArray &bytes) {
       DWORD written = 0;
       check(WriteFile(file.value, bytes.constData(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
             written == bytes.size(), "staged file write failed");
     }, files[i].second, &progress);
   }
-  check(!cancelled(), "file transfer cancelled");
+  check(!transferCancelled(), "file transfer cancelled");
   progress.report("staged");
   auto result = staged.value; staged.value = nullptr; cleanup.directory.clear(); return result;
   } catch (const std::exception &) {
-    progress.report(cancelled() ? "cancelled" : "failed");
+    progress.report(transferCancelled() ? "cancelled" : "failed");
     throw;
   }
 }

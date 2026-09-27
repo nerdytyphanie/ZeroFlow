@@ -26,7 +26,7 @@ HeadlessControl::HeadlessControl(std::function<void()> stop, std::function<void(
         auto speed = command["speedMiB"].toInteger(-1), maximum = command["selectionMiB"].toInteger(-1);
         auto files = command["files"].toInteger(128);
         if (speed >= 0 && speed <= INT64_MAX / 1048576 && maximum >= 0 && maximum <= INT64_MAX / 1048576 && files >= 0 && files < UINT32_MAX - 2)
-          FileClipboardTransfer::configure(speed, maximum, static_cast<quint32>(files));
+          FileClipboardTransfer::configure(speed, maximum, static_cast<quint32>(files), command["filesEnabled"].toBool(true));
       }
       if (command.value("command").toString() == "stop") { m_timer.stop(); stop(); return; }
     }
