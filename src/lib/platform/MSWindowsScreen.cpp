@@ -236,6 +236,10 @@ void MSWindowsScreen::enter()
 {
   m_desks->enter();
   if (m_isPrimary) {
+    // Display topology may have changed while input was on another screen.
+    updateScreenShape();
+    m_hook.setZone(m_x, m_y, m_w, m_h, getJumpZoneSize());
+
     // enable special key sequences on win95 family
     enableSpecialKeys(true);
 
@@ -1344,19 +1348,16 @@ bool MSWindowsScreen::onDisplayChange()
 
   // update shape
   updateScreenShape();
+  // Refresh the jump zones even while relaying input to another screen.
+  if (m_isPrimary) {
+    m_hook.setZone(m_x, m_y, m_w, m_h, getJumpZoneSize());
+  }
 
   // do nothing if resolution hasn't changed
   if (xOld != m_x || yOld != m_y || wOld != m_w || hOld != m_h) {
-    if (m_isPrimary) {
-      if (!m_isOnScreen) {
-        LOG_VERBOSE("centering cursor on display change: %+d, %+d", m_xCenter, m_yCenter);
-        warpCursor(m_xCenter, m_yCenter);
-      }
-
-      // tell hook about resize if on screen
-      else {
-        m_hook.setZone(m_x, m_y, m_w, m_h, getJumpZoneSize());
-      }
+    if (m_isPrimary && !m_isOnScreen) {
+      LOG_VERBOSE("centering cursor on display change: %+d, %+d", m_xCenter, m_yCenter);
+      warpCursor(m_xCenter, m_yCenter);
     }
 
     // send new screen info
